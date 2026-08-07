@@ -385,6 +385,45 @@ def build_jax_math_engine(jax):
         y3 = sub_256_raw(mul_256_mod_p(lam, x1_minus_x3), y1)
         return x3, y3
 
+    @jax.jit
+    def ecc_add_mixed_jacobian(x1: jnp.ndarray, y1: jnp.ndarray, z1: jnp.ndarray,
+                               x2: jnp.ndarray, y2: jnp.ndarray):
+        """
+        Mixed Jacobian + Affine Point Addition for secp256k1 (a=0):
+        (X3, Y3, Z3) = (X1, Y1, Z1) + (X2, Y2, 1)
+        Cost: ZERO INVERSIONS, 8 modular multiplications!
+        """
+        z1_sq = mul_256_mod_p(z1, z1)
+        u2 = mul_256_mod_p(x2, z1_sq)
+        z1_cub = mul_256_mod_p(z1, z1_sq)
+        s2 = mul_256_mod_p(y2, z1_cub)
+        h = sub_256_raw(u2, x1)
+        r = sub_256_raw(s2, y1)
+        h_sq = mul_256_mod_p(h, h)
+        h_cub = mul_256_mod_p(h, h_sq)
+        v = mul_256_mod_p(x1, h_sq)
+        
+        r_sq = mul_256_mod_p(r, r)
+        two_v = add_256_raw(v, v)
+        x3 = sub_256_raw(sub_256_raw(r_sq, h_cub), two_v)
+        
+        v_minus_x3 = sub_256_raw(v, x3)
+        y1_hcub = mul_256_mod_p(y1, h_cub)
+        y3 = sub_256_raw(mul_256_mod_p(r, v_minus_x3), y1_hcub)
+        
+        z3 = mul_256_mod_p(z1, h)
+        return x3, y3, z3
+
+    @jax.jit
+    def jacobian_to_affine(x: jnp.ndarray, y: jnp.ndarray, z: jnp.ndarray):
+        """Convert Jacobian Coordinates (X, Y, Z) back to Affine (X/Z^2, Y/Z^3)."""
+        z_inv = inv_mod_p(z)
+        z_inv2 = mul_256_mod_p(z_inv, z_inv)
+        z_inv3 = mul_256_mod_p(z_inv, z_inv2)
+        ax = mul_256_mod_p(x, z_inv2)
+        ay = mul_256_mod_p(y, z_inv3)
+        return ax, ay
+
     # --------------------------------------------------------------------------
     # 5. VECTORIZED KANGAROO JUMP ENGINE (Jump Table + jnp.take)
     # --------------------------------------------------------------------------
@@ -414,29 +453,30 @@ def build_jax_math_engine(jax):
         return next_x, next_y, next_dist, is_dp
 
     @functools.partial(jax.jit, static_argnames=('steps_per_block',))
-    def tpu_conconfined_loop(init_x: jnp.ndarray, init_y: jnp.ndarray, init_dist: jnp.ndarray,
+    def tpu_conconfined_loop(init_x: jnp.ndarray, init_y: jnp.ndarray, init_z: jnp.ndarray, init_dist: jnp.ndarray,
                              table_x: jnp.ndarray, table_y: jnp.ndarray, table_dists: jnp.ndarray,
                              dp_mask: jnp.uint64, steps_per_block: int = 10):
         """
-        Executes sequential ECC jumps DIRECTLY on TPU hardware,
+        Executes zero-inversion Jacobian ECC jumps DIRECTLY on TPU hardware,
         without any data transfer or bus interruption per step.
         """
         table_size = table_x.shape[0]
 
         def body_fun(i, state):
-            cx, cy, cd = state
+            cx, cy, cz, cd = state
             jump_idx = (cx[..., 0] & jnp.uint64(table_size - 1)).astype(jnp.int32)
             j_x = jnp.take(table_x, jump_idx, axis=0)
             j_y = jnp.take(table_y, jump_idx, axis=0)
             j_d = jnp.take(table_dists, jump_idx, axis=0)
-            nx, ny = ecc_add_affine(cx, cy, j_x, j_y)
+            nx, ny, nz = ecc_add_mixed_jacobian(cx, cy, cz, j_x, j_y)
             nd = cd + j_d
-            return nx, ny, nd
+            return nx, ny, nz, nd
 
-        init_state = (init_x, init_y, init_dist)
-        final_x, final_y, final_dist = jax.lax.fori_loop(0, steps_per_block, body_fun, init_state)
-        final_dp_flags = (final_x[..., 0] & dp_mask) == jnp.uint64(0)
-        return final_x, final_y, final_dist, final_dp_flags
+        init_state = (init_x, init_y, init_z, init_dist)
+        final_jx, final_jy, final_jz, final_dist = jax.lax.fori_loop(0, steps_per_block, body_fun, init_state)
+        final_ax, final_ay = jacobian_to_affine(final_jx, final_jy, final_jz)
+        final_dp_flags = (final_ax[..., 0] & dp_mask) == jnp.uint64(0)
+        return final_ax, final_ay, final_jx, final_jy, final_jz, final_dist, final_dp_flags
 
     return {
         "add_256": add_256_raw,
@@ -446,6 +486,8 @@ def build_jax_math_engine(jax):
         "batch_inverse_mod_p": batch_inverse_mod_p,
         "ecc_add": ecc_add_affine,
         "ecc_double": ecc_double_affine,
+        "ecc_add_mixed_jacobian": ecc_add_mixed_jacobian,
+        "jacobian_to_affine": jacobian_to_affine,
         "jump_step": kangaroo_jump_step,
         "tpu_conconfined_loop": tpu_conconfined_loop,
     }
@@ -753,8 +795,12 @@ def main():
 
     batch_kx_np = np.vstack([tame_x_np, wild_x_np])
     batch_ky_np = np.vstack([tame_y_np, wild_y_np])
+    batch_kz_np = np.zeros((N, 8), dtype=np.uint64)
+    batch_kz_np[:, 0] = 1
+    
     batch_kx = jnp.array(batch_kx_np, dtype=jnp.uint64)
     batch_ky = jnp.array(batch_ky_np, dtype=jnp.uint64)
+    batch_kz = jnp.array(batch_kz_np, dtype=jnp.uint64)
     batch_dist = jnp.zeros((N,), dtype=jnp.uint64)
 
 
@@ -771,12 +817,12 @@ def main():
 
     dp_mask = jnp.uint64((1 << dp_bits) - 1)
     steps_per_block = args.inner_steps if args.inner_steps > 0 else 10
-    print(f"🔥 MÁXIMA FORÇA ATIVADA: JIT Compilando blocos de {steps_per_block:,} saltos confinados...")
+    print(f"🔥 MÁXIMA FORÇA ATIVADA: JIT Compilando blocos de {steps_per_block:,} saltos confinados (Zero Inversões Jacobianas)...")
     t_jit_jump = time.time()
-    test_fx, test_fy, test_fd, test_dp = engine["tpu_conconfined_loop"](
-        batch_kx, batch_ky, batch_dist, tx_jax, ty_jax, td_jax, dp_mask, steps_per_block=steps_per_block
+    test_ax, test_ay, test_jx, test_jy, test_jz, test_fd, test_dp = engine["tpu_conconfined_loop"](
+        batch_kx, batch_ky, batch_kz, batch_dist, tx_jax, ty_jax, td_jax, dp_mask, steps_per_block=steps_per_block
     )
-    test_fx.block_until_ready()
+    test_ax.block_until_ready()
     print(f"✅ Kernel TPU Confinado JIT Compilado em {time.time() - t_jit_jump:.4f}s")
 
     print(f"🔥 Executando marcha contínua na matriz sistólica across {N:,} kangaroos ({steps_per_block:,} saltos/bloco)...")
@@ -788,14 +834,14 @@ def main():
     total_dps = 0
 
     t_start = time.time()
-    curr_x, curr_y, curr_dist = batch_kx, batch_ky, batch_dist
+    curr_jx, curr_jy, curr_jz, curr_dist = batch_kx, batch_ky, batch_kz, batch_dist
     bloco = 0
 
     while True:
         bloco += 1
         
-        curr_x, curr_y, curr_dist, dp_flags = engine["tpu_conconfined_loop"](
-            curr_x, curr_y, curr_dist,
+        curr_ax, curr_ay, curr_jx, curr_jy, curr_jz, curr_dist, dp_flags = engine["tpu_conconfined_loop"](
+            curr_jx, curr_jy, curr_jz, curr_dist,
             tx_jax, ty_jax, td_jax,
             dp_mask,
             steps_per_block=steps_per_block
@@ -807,7 +853,7 @@ def main():
 
         if len(indices_dp) > 0:
             dp_indices_jax = jnp.array(indices_dp)
-            dp_x_np = np.array(curr_x[dp_indices_jax].block_until_ready())
+            dp_x_np = np.array(curr_ax[dp_indices_jax].block_until_ready())
             dp_dist_np = np.array(curr_dist[dp_indices_jax].block_until_ready())
             
             log_lines = []
@@ -860,7 +906,7 @@ def main():
         if args.steps > 0 and (bloco * steps_per_block) >= args.steps:
             break
 
-    curr_x.block_until_ready()
+    curr_jx.block_until_ready()
     t_end = time.time() - t_start
     
     total_ops = N * bloco * steps_per_block
