@@ -55,6 +55,7 @@ char gTamesFileName[1024];
 double gMax;
 bool gGenMode; //tames generation mode
 bool gIsOpsLimit;
+bool gStreamDPs = false;
 
 #pragma pack(push, 1)
 struct DBRec
@@ -232,6 +233,15 @@ void CheckNewPoints()
 		nrec.type = gGenMode ? TAME : p[40];
 
 		DBRec* pref = (DBRec*)db.FindOrAddDataBlock((u8*)&nrec);
+		if (gStreamDPs)
+		{
+			printf("DP_ENTRY:%d:%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x:", nrec.type,
+				nrec.x[0], nrec.x[1], nrec.x[2], nrec.x[3], nrec.x[4], nrec.x[5],
+				nrec.x[6], nrec.x[7], nrec.x[8], nrec.x[9], nrec.x[10], nrec.x[11]);
+			for (int d = 0; d < 22; d++) printf("%02x", nrec.d[d]);
+			printf("\n");
+			fflush(stdout);
+		}
 		if (gGenMode)
 			continue;
 		if (pref)
@@ -599,6 +609,11 @@ bool ParseCommandLine(int argc, char* argv[])
 		{
 			strcpy(gTamesFileName, argv[ci]);
 			ci++;
+		}
+		else
+		if (strcmp(argument, "-stream-dps") == 0)
+		{
+			gStreamDPs = true;
 		}
 		else
 		if (strcmp(argument, "-max") == 0)

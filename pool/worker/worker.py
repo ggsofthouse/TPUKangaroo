@@ -206,6 +206,35 @@ def http_get(endpoint: str, retries: int = 3) -> dict:
             return {}
     return {}
 
+dp_batch_queue = queue.Queue()
+
+def dp_uploader_loop():
+    while True:
+        time.sleep(10)
+        items = []
+        while not dp_batch_queue.empty() and len(items) < 2000:
+            try:
+                items.append(dp_batch_queue.get_nowait())
+            except queue.Empty:
+                break
+        if items:
+            try:
+                res = http_post("/api/dp/submit_batch", {
+                    "worker_name": WORKER_NAME,
+                    "puzzle_number": TARGET_PUZZLE,
+                    "dps": items
+                })
+                if res and res.get("status") == "ok":
+                    total_global = res.get("total_global_dps", 0)
+                    print(f"📦 [DP Pool] Enviou lote de {len(items)} DPs para a VPS. (Total Global no Servidor: {total_global:,})")
+                    if res.get("solved"):
+                        print(f"🎉 COLISÃO GLOBAL CONFIRMADA PELO SERVIDOR! Chave: 0x{res.get('private_key')}")
+            except Exception as e:
+                print(f"⚠️ Erro no upload de lote de DPs: {e}")
+
+_dp_uploader_thread = threading.Thread(target=dp_uploader_loop, daemon=True)
+_dp_uploader_thread.start()
+
 def ensure_tames_file(puzzle_number: int, bin_dir: str) -> Optional[str]:
     """Verifica se o servidor da pool possui arquivo de tames pré-gerado para este puzzle.
     Se sim, baixa para o diretório do binário RCKangaroo.
@@ -383,7 +412,8 @@ def main():
                     "-range", str(range_bits),
                     "-start", start_hex,
                     "-pubkey", pubkey,
-                    "-max", str(max_ops)
+                    "-max", str(max_ops),
+                    "-stream-dps"
                 ]
                 if tame_file:
                     cmd.extend(["-tames", tame_file])
@@ -414,7 +444,22 @@ def main():
                     if line_str:
                         if line_str.strip():
                             line_str = line_str.strip()
-                            print(f"[RCK] {line_str}")
+                            if line_str.startswith("DP_ENTRY:"):
+                                parts = line_str.split(":")
+                                if len(parts) >= 4:
+                                    try:
+                                        dp_type = int(parts[1])
+                                        x_prefix = parts[2]
+                                        dist_hex = parts[3]
+                                        dp_batch_queue.put({
+                                            "x_prefix": x_prefix,
+                                            "dist_hex": dist_hex,
+                                            "dp_type": dp_type
+                                        })
+                                    except Exception:
+                                        pass
+                            else:
+                                print(f"[RCK] {line_str}")
 
                             # Parse Hashrate
                             mhs_match = re.search(r'Speed:\s*(\d+(?:\.\d+)?)\s*MKeys', line_str, re.IGNORECASE)

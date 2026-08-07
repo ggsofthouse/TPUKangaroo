@@ -331,6 +331,20 @@ def init_db():
             except Exception:
                 pass
 
+        # Tabela global de DPs acumulados por todos os workers
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS global_dps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                puzzle_number INTEGER DEFAULT 140,
+                x_prefix TEXT NOT NULL,
+                dist_hex TEXT NOT NULL,
+                dp_type INTEGER DEFAULT 0,
+                worker_name TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+        ''')
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_global_dps_x ON global_dps(puzzle_number, x_prefix)")
+
         conn.commit()
 
         # WAL mode: múltiplos leitores simultâneos sem bloquear escritas
@@ -339,7 +353,31 @@ def init_db():
         conn.commit()
         conn.close()
 
+GLOBAL_DP_CACHE: Dict[tuple, List[dict]] = {}
+
+def load_global_dp_cache():
+    global GLOBAL_DP_CACHE
+    with db_lock:
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT puzzle_number, x_prefix, dist_hex, dp_type, worker_name FROM global_dps")
+        rows = cursor.fetchall()
+        cache = {}
+        for r in rows:
+            key = (int(r["puzzle_number"]), str(r["x_prefix"]).lower())
+            if key not in cache:
+                cache[key] = []
+            cache[key].append({
+                "dist_hex": str(r["dist_hex"]).lower(),
+                "type": int(r["dp_type"]),
+                "worker": str(r["worker_name"])
+            })
+        GLOBAL_DP_CACHE = cache
+        print(f"🧠 Cache de DPs Globais carregado na memória: {len(rows)} DPs totais.")
+        conn.close()
+
 init_db()
+load_global_dp_cache()
 
 # ─── Background: recoloca chunks abandonados de volta para PENDING ────────────
 # Timeout configurável por env var: chunks grandes (90-bits) podem durar horas
@@ -423,6 +461,16 @@ class SubmitSolutionRequest(BaseModel):
     chunk_id: str
     pubkey: str
     private_key: str
+
+class DPItem(BaseModel):
+    x_prefix: str
+    dist_hex: str
+    dp_type: int = 0
+
+class DPBatchSubmit(BaseModel):
+    worker_name: str
+    puzzle_number: int = 140
+    dps: List[DPItem]
 
 # Preset Puzzles Dictionary (Dados Oficiais dos Desafios Bitcoin)
 # chunk_bits: tamanho de cada fatia de trabalho por puzzle
@@ -541,6 +589,128 @@ def internal_create_job(req: CreateJobRequest) -> str:
 def create_job(req: CreateJobRequest, username: str = Depends(authenticate_dashboard)):
     job_id = internal_create_job(req)
     return {"status": "SUCCESS", "job_id": job_id}
+
+# ─── Endpoints do Banco Global de DPs ──────────────────────────────────────────
+@app.post("/api/dp/submit_batch")
+def submit_dp_batch(data: DPBatchSubmit, request: Request):
+    verify_worker_token(request)
+    if not data.dps:
+        return {"status": "ok", "ingested": 0, "total_global_dps": sum(len(v) for v in GLOBAL_DP_CACHE.values()), "solved": False}
+
+    solved = False
+    solved_key = None
+    ingested_count = 0
+    now = time.time()
+
+    with db_lock:
+        conn = get_db()
+        cursor = conn.cursor()
+
+        job_row = cursor.execute(
+            "SELECT pubkey, job_id FROM jobs WHERE status='ACTIVE' ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        target_pubkey = job_row["pubkey"] if job_row else None
+        job_id = job_row["job_id"] if job_row else None
+
+        db_records = []
+        for dp in data.dps:
+            x_clean = dp.x_prefix.strip().lower()
+            d_clean = dp.dist_hex.strip().lower()
+            dp_type = int(dp.dp_type)
+            cache_key = (data.puzzle_number, x_clean)
+
+            if cache_key in GLOBAL_DP_CACHE:
+                for existing in GLOBAL_DP_CACHE[cache_key]:
+                    if existing["type"] != dp_type or existing["dist_hex"] != d_clean:
+                        try:
+                            dist1 = int(existing["dist_hex"], 16)
+                            dist2 = int(d_clean, 16)
+                            candidates = []
+                            if dist1 > dist2:
+                                candidates.append(f"{dist1 - dist2:064x}")
+                                candidates.append(f"{dist2 - dist1:064x}")
+                            else:
+                                candidates.append(f"{dist2 - dist1:064x}")
+                                candidates.append(f"{dist1 - dist2:064x}")
+
+                            if target_pubkey:
+                                for cand in candidates:
+                                    if verify_private_key(cand, target_pubkey):
+                                        solved = True
+                                        solved_key = cand
+                                        log_event(f"🎉 COLISÃO GLOBAL DE DP DETECTADA! Worker: {data.worker_name} | Chave: 0x{cand}")
+                                        if job_id:
+                                            cursor.execute(
+                                                "UPDATE jobs SET status='SOLVED', solved_at=?, solved_by=?, private_key=? WHERE job_id=?",
+                                                (now, data.worker_name, cand, job_id)
+                                            )
+                                            results_path = os.path.join(BASE_DIR, "POOL_RESULTS.TXT")
+                                            wif = hex_to_wif(cand)
+                                            addr = pubkey_to_address(target_pubkey)
+                                            with open(results_path, "a", encoding="utf-8") as f:
+                                                f.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] PUZZLE #{data.puzzle_number} RESOLVIDO VIA DP GLOBAL!\n")
+                                                f.write(f"  Worker: {data.worker_name}\n")
+                                                f.write(f"  Pubkey: {target_pubkey}\n")
+                                                f.write(f"  PrivKey Hex: 0x{cand}\n")
+                                                f.write(f"  WIF: {wif}\n")
+                                                f.write(f"  Endereco BTC: {addr}\n")
+                                        break
+                        except Exception as ex:
+                            print(f"⚠️ Erro ao calcular candidato de colisão DP: {ex}")
+
+            db_records.append((data.puzzle_number, x_clean, d_clean, dp_type, data.worker_name, now))
+            if cache_key not in GLOBAL_DP_CACHE:
+                GLOBAL_DP_CACHE[cache_key] = []
+            GLOBAL_DP_CACHE[cache_key].append({
+                "dist_hex": d_clean,
+                "type": dp_type,
+                "worker": data.worker_name
+            })
+            ingested_count += 1
+
+        if db_records:
+            cursor.executemany(
+                "INSERT INTO global_dps (puzzle_number, x_prefix, dist_hex, dp_type, worker_name, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                db_records
+            )
+            cursor.execute(
+                "UPDATE workers SET dps_count = dps_count + ? WHERE name = ?",
+                (ingested_count, data.worker_name)
+            )
+            conn.commit()
+
+        conn.close()
+
+    total_cached = sum(len(v) for v in GLOBAL_DP_CACHE.values())
+    return {
+        "status": "ok",
+        "ingested": ingested_count,
+        "total_global_dps": total_cached,
+        "solved": solved,
+        "private_key": solved_key
+    }
+
+@app.get("/api/dp/stats")
+def get_dp_stats():
+    total_cached = sum(len(v) for v in GLOBAL_DP_CACHE.values())
+    tames = 0
+    wilds = 0
+    worker_counts = {}
+    for (puzz, x), items in GLOBAL_DP_CACHE.items():
+        for item in items:
+            if item["type"] == 0:
+                tames += 1
+            else:
+                wilds += 1
+            w = item["worker"]
+            worker_counts[w] = worker_counts.get(w, 0) + 1
+
+    return {
+        "total_dps": total_cached,
+        "tames_count": tames,
+        "wilds_count": wilds,
+        "worker_contributions": worker_counts
+    }
 
 @app.post("/api/jobs/delete/{job_id}")
 def delete_single_job(job_id: str, username: str = Depends(authenticate_dashboard)):
@@ -759,9 +929,8 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
         # Calcula soma real de chaves e total de chunks concluidos
         total_completed_chunks = sum(j['completed_chunks'] for j in jobs)
         cursor = get_db().cursor()
-        cursor.execute("SELECT range_bits FROM chunks WHERE status IN ('COMPLETED', 'SOLVED')")
-        rows = cursor.fetchall()
-        keys_tested = sum(2**int(r[0]) for r in rows)
+        # Operações computacionais reais do Kangaroo = 1.15 * 2^(range_bits / 2) por chunk
+        keys_tested = sum(int(1.15 * (2 ** (int(r[0]) / 2.0))) for r in rows)
         keys_tested_live = keys_tested
         if keys_tested_live == 0 and total_hashrate > 0 and jobs:
             act_j = next((j for j in jobs if j.get("status") == "ACTIVE"), jobs[0])
@@ -770,7 +939,9 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
                 elapsed_sec = max(0, time.time() - c_time)
                 keys_tested_live = int(total_hashrate * 1_000_000 * elapsed_sec)
 
-        if keys_tested_live >= 10**21:
+        if keys_tested_live >= 10**24:
+            keys_zetta_str = f"{keys_tested_live / (10**24):.2f} Yottakeys"
+        elif keys_tested_live >= 10**21:
             keys_zetta_str = f"{keys_tested_live / (10**21):.2f} Zetakeys"
         elif keys_tested_live >= 10**18:
             keys_zetta_str = f"{keys_tested_live / (10**18):.2f} Exakeys"
@@ -780,12 +951,17 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
             keys_zetta_str = f"{keys_tested_live / (10**12):.2f} Terakeys"
         elif keys_tested_live >= 10**9:
             keys_zetta_str = f"{keys_tested_live / (10**9):.2f} Gigakeys"
+        else:
+            keys_zetta_str = f"{keys_tested_live} Keys"
+
         expected_ops = 1.15 * (2 ** 69.5)
         prob_pct = (keys_tested_live / expected_ops) * 100.0 if expected_ops > 0 else 0.0
-        if prob_pct < 0.0001 and prob_pct > 0:
+        if prob_pct > 100.0:
+            prob_pct_str = "100.0% (Faixa Concluída)"
+        elif prob_pct < 0.0001 and prob_pct > 0:
             prob_pct_str = f"{prob_pct:.6f}%"
         else:
-            prob_pct_str = f"{prob_pct:.4f}%"
+            prob_pct_str = f"{prob_pct:.2f}%"
 
         # Cálculo de métricas avançadas do Cluster
         total_gpus = 0
@@ -837,16 +1013,13 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
                 active_job_uptime = f"{h}h {m}m"
 
         active_dps = sum(w.get('dps_count', 0) for w in workers if w.get('dps_count'))
-        total_dps_cnt = active_dps + int(keys_tested / 262144)
-        if total_dps_cnt == 0 and total_hashrate > 0 and jobs:
-            act_j = next((j for j in jobs if j.get("status") == "ACTIVE"), jobs[0])
-            c_time = act_j.get("created_at")
-            if c_time:
-                elapsed_sec = max(0, time.time() - c_time)
-                est_dps = int((total_hashrate * 1_000_000 / 262144.0) * elapsed_sec)
-                total_dps_cnt = max(total_dps_cnt, est_dps)
+        total_dps_cnt = sum(len(v) for v in GLOBAL_DP_CACHE.values())
+        if total_dps_cnt == 0:
+            total_dps_cnt = active_dps
 
-        if total_dps_cnt >= 1_000_000_000:
+        if total_dps_cnt >= 1_000_000_000_000:
+            total_dps_str = f"{total_dps_cnt / 1_000_000_000_000:.2f}T DPs"
+        elif total_dps_cnt >= 1_000_000_000:
             total_dps_str = f"{total_dps_cnt / 1_000_000_000:.2f}B DPs"
         elif total_dps_cnt >= 1_000_000:
             total_dps_str = f"{total_dps_cnt / 1_000_000:.2f}M DPs"
@@ -1535,14 +1708,18 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
             <!-- Solved Alert Banner -->
             <div id="solved-solutions-container" class="mb-4"></div>
 
-            <!-- Saiyan Stat Cards (2 Rows of 3 Cards) -->
+            <!-- SEÇÃO 1: RECURSOS EM EXECUÇÃO AGORA (EM TEMPO REAL) -->
+            <div class="d-flex align-items-center gap-2 mb-3">
+                <span class="fs-5">⚡</span>
+                <h2 class="h6 mb-0 text-warning font-saiyan fw-bold glow-gold">STATUS EM TEMPO REAL (EM EXECUÇÃO AGORA)</h2>
+            </div>
             <div class="row g-3 mb-4">
                 <!-- 1. PODER DE LUTA (HASHRATE AGREGADO) -->
-                <div class="col-12 col-md-4">
+                <div class="col-12 col-md-3">
                     <div class="glass-card stat-card-saiyan" style="--accent-color: var(--accent-gold);">
                         <div class="d-flex justify-content-between align-items-center">
                             <div class="stat-title">💥 PODER DE LUTA AGREGADO</div>
-                            <span class="badge badge-glow-gold fs-8 font-saiyan">SUPER SAIYAN</span>
+                            <span class="badge badge-glow-gold fs-8 font-saiyan">LIVE</span>
                         </div>
                         <div class="stat-header text-warning glow-gold mt-1" id="pool-hashrate">0.00 GKeys/s</div>
                         <div class="fs-7 text-secondary mt-1">Throughput total combinado das GPUs</div>
@@ -1551,40 +1728,12 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                         </div>
                     </div>
                 </div>
-                <!-- 2. ENERGIAS TESTADAS (EXAKEYS & COBERTURA) -->
-                <div class="col-12 col-md-4">
-                    <div class="glass-card stat-card-saiyan" style="--accent-color: var(--accent-cyan);">
-                        <div class="d-flex justify-content-between align-items-center">
-                            <div class="stat-title">🔮 ENERGIAS TESTADAS (EXAKEYS)</div>
-                            <span class="badge badge-glow-cyan fs-8 font-saiyan">PUZZLE #140</span>
-                        </div>
-                        <div class="stat-header text-info glow-cyan mt-1" id="keys-tested">0.00 Exakeys</div>
-                        <div class="fs-7 text-secondary mt-1" id="keys-tested-subtext">Soma acumulada de chaves verificadas</div>
-                        <div class="ki-gauge-bg">
-                            <div class="ki-gauge-fill" style="width: 85%; background: linear-gradient(90deg, #0284c7, #38bdf8);"></div>
-                        </div>
-                    </div>
-                </div>
-                <!-- 3. DPs MARCADOS & SALVOS NA VPS -->
-                <div class="col-12 col-md-4">
-                    <div class="glass-card stat-card-saiyan" style="--accent-color: var(--accent-purple);">
-                        <div class="d-flex justify-content-between align-items-center">
-                            <div class="stat-title">🦘 DPS MARCADOS & SALVOS NA VPS</div>
-                            <span class="badge badge-glow-purple fs-8 font-saiyan">PUZZLE #140</span>
-                        </div>
-                        <div class="stat-header text-purple mt-1" style="color: #c084fc;" id="dp-overhead">0 DPs</div>
-                        <div class="fs-7 text-secondary mt-1" id="dp-overhead-subtext">Armadilhas registradas permanentemente no SQLite WAL</div>
-                        <div class="ki-gauge-bg">
-                            <div class="ki-gauge-fill" style="width: 100%; background: linear-gradient(90deg, #9333ea, #c084fc);"></div>
-                        </div>
-                    </div>
-                </div>
 
-                <!-- 4. GUERREIROS Z (GPUs ATIVAS) -->
-                <div class="col-12 col-md-4">
+                <!-- 2. GUERREIROS Z (GPUs ATIVAS AGORA) -->
+                <div class="col-12 col-md-3">
                     <div class="glass-card stat-card-saiyan" style="--accent-color: var(--accent-green);">
                         <div class="d-flex justify-content-between align-items-center">
-                            <div class="stat-title">🔥 NODES SAIYAJINS ATIVOS</div>
+                            <div class="stat-title">🔥 NODES ATIVOS AGORA</div>
                             <span class="badge badge-glow-green fs-8 font-saiyan">WORKERS</span>
                         </div>
                         <div class="stat-header text-success glow-green mt-1" id="active-kangaroos">0.0M</div>
@@ -1594,12 +1743,28 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                         </div>
                     </div>
                 </div>
-                <!-- 5. CRONÔMETRO SAIYAJIN & ESTIMATIVA -->
-                <div class="col-12 col-md-4">
+
+                <!-- 3. TAXA DE DPS EM TEMPO REAL -->
+                <div class="col-12 col-md-3">
+                    <div class="glass-card stat-card-saiyan" style="--accent-color: var(--accent-cyan);">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <div class="stat-title">⚡ TAXA DE DPS (STREAM)</div>
+                            <span class="badge badge-glow-cyan fs-8 font-saiyan">LIVE DPS</span>
+                        </div>
+                        <div class="stat-header text-info mt-1" id="completed-chunks">0 DPs/s</div>
+                        <div class="fs-7 text-secondary mt-1" id="chunks-total-subtext">Eficiência ideal K ≈ 1.15 (0% Overhead)</div>
+                        <div class="ki-gauge-bg">
+                            <div class="ki-gauge-fill" style="width: 95%; background: linear-gradient(90deg, #0284c7, #38bdf8);"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 4. TEMPO ATIVO DA SESSÃO ATUAL -->
+                <div class="col-12 col-md-3">
                     <div class="glass-card stat-card-saiyan" style="--accent-color: var(--accent-gold);">
                         <div class="d-flex justify-content-between align-items-center">
-                            <div class="stat-title">⏱️ TEMPO ATIVO & PROBABILIDADE</div>
-                            <span class="badge badge-glow-gold fs-8 font-saiyan">TEMPO RECRUTADO</span>
+                            <div class="stat-title">⏱️ SESSÃO ATIVA</div>
+                            <span class="badge badge-glow-gold fs-8 font-saiyan">TEMPO</span>
                         </div>
                         <div class="stat-header text-warning mt-1" id="job-uptime">0h 0m</div>
                         <div class="fs-7 text-secondary mt-1">Duração da sessão ativa na Pool</div>
@@ -1608,17 +1773,40 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                         </div>
                     </div>
                 </div>
-                <!-- 6. TAXA DE DPS & EFICIÊNCIA K -->
-                <div class="col-12 col-md-4">
+            </div>
+
+            <!-- SEÇÃO 2: HISTÓRICO ACUMULADO & BANCO DE DADOS DA POOL (EM BAIXO) -->
+            <div class="d-flex align-items-center gap-2 mb-3">
+                <span class="fs-5">📊</span>
+                <h2 class="h6 mb-0 text-info font-saiyan fw-bold glow-cyan">HISTÓRICO ACUMULADO & BANCO DE DADOS DA POOL (VPS)</h2>
+            </div>
+            <div class="row g-3 mb-4">
+                <!-- 1. ENERGIAS TESTADAS (HISTÓRICO DE CHAVES) -->
+                <div class="col-12 col-md-6">
                     <div class="glass-card stat-card-saiyan" style="--accent-color: var(--accent-cyan);">
                         <div class="d-flex justify-content-between align-items-center">
-                            <div class="stat-title">⚡ TAXA DE DPS & EFICIÊNCIA K</div>
-                            <span class="badge badge-glow-cyan fs-8 font-saiyan">SOTA V2</span>
+                            <div class="stat-title">🔮 TOTAL HISTÓRICO DE CHAVES TESTADAS</div>
+                            <span class="badge badge-glow-cyan fs-8 font-saiyan">PUZZLE #140</span>
                         </div>
-                        <div class="stat-header text-info mt-1" id="completed-chunks">0 DPs/s</div>
-                        <div class="fs-7 text-secondary mt-1" id="chunks-total-subtext">Eficiência ideal K ≈ 1.15 (0% DP Overhead)</div>
+                        <div class="stat-header text-info glow-cyan mt-1" id="keys-tested">0.00 Exakeys</div>
+                        <div class="fs-7 text-secondary mt-1" id="keys-tested-subtext">Soma acumulada de chaves verificadas</div>
                         <div class="ki-gauge-bg">
-                            <div class="ki-gauge-fill" style="width: 95%; background: linear-gradient(90deg, #0284c7, #38bdf8);"></div>
+                            <div class="ki-gauge-fill" style="width: 85%; background: linear-gradient(90deg, #0284c7, #38bdf8);"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 2. BANCO GLOBAL DE DPS SALVOS NA VPS -->
+                <div class="col-12 col-md-6">
+                    <div class="glass-card stat-card-saiyan" style="--accent-color: var(--accent-purple);">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <div class="stat-title">🦘 BANCO GLOBAL DE DPS SALVOS NA VPS</div>
+                            <span class="badge badge-glow-purple fs-8 font-saiyan">PUZZLE #140</span>
+                        </div>
+                        <div class="stat-header text-purple mt-1" style="color: #c084fc;" id="dp-overhead">0 DPs</div>
+                        <div class="fs-7 text-secondary mt-1" id="dp-overhead-subtext">Armadilhas registradas permanentemente no SQLite WAL</div>
+                        <div class="ki-gauge-bg">
+                            <div class="ki-gauge-fill" style="width: 100%; background: linear-gradient(90deg, #9333ea, #c084fc);"></div>
                         </div>
                     </div>
                 </div>
