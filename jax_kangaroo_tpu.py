@@ -712,11 +712,10 @@ def main():
 
     dp_mask = jnp.uint64((1 << dp_bits) - 1)
     steps_per_block = args.inner_steps if args.inner_steps > 0 else 10
-    MB = min(N, 1048576)
     print(f"🔥 MÁXIMA FORÇA ATIVADA: JIT Compilando blocos de {steps_per_block:,} saltos confinados...")
     t_jit_jump = time.time()
     test_fx, test_fy, test_fd, test_dp = engine["tpu_conconfined_loop"](
-        batch_kx[:MB], batch_ky[:MB], batch_dist[:MB], tx_jax, ty_jax, td_jax, dp_mask, steps_per_block=steps_per_block
+        batch_kx, batch_ky, batch_dist, tx_jax, ty_jax, td_jax, dp_mask, steps_per_block=steps_per_block
     )
     test_fx.block_until_ready()
     print(f"✅ Kernel TPU Confinado JIT Compilado em {time.time() - t_jit_jump:.4f}s")
@@ -736,74 +735,59 @@ def main():
     while True:
         bloco += 1
         
-        next_x_chunks, next_y_chunks, next_dist_chunks = [], [], []
-        dps_no_bloco = 0
-        for start_idx in range(0, N, MB):
-            end_idx = min(start_idx + MB, N)
-            fx, fy, fd, dp_flags = engine["tpu_conconfined_loop"](
-                curr_x[start_idx:end_idx],
-                curr_y[start_idx:end_idx],
-                curr_dist[start_idx:end_idx],
-                tx_jax, ty_jax, td_jax,
-                dp_mask,
-                steps_per_block=steps_per_block
-            )
-            next_x_chunks.append(fx)
-            next_y_chunks.append(fy)
-            next_dist_chunks.append(fd)
+        curr_x, curr_y, curr_dist, dp_flags = engine["tpu_conconfined_loop"](
+            curr_x, curr_y, curr_dist,
+            tx_jax, ty_jax, td_jax,
+            dp_mask,
+            steps_per_block=steps_per_block
+        )
 
-            dp_flags_cpu = np.array(dp_flags.block_until_ready())
-            indices_dp = np.where(dp_flags_cpu)[0]
-            dps_no_bloco += len(indices_dp)
-            total_dps += len(indices_dp)
+        dp_flags_cpu = np.array(dp_flags.block_until_ready())
+        indices_dp = np.where(dp_flags_cpu)[0]
+        total_dps += len(indices_dp)
 
-            if len(indices_dp) > 0:
-                fx_np = np.array(fx)
-                fd_np = np.array(fd)
-                for chunk_idx in indices_dp:
-                    global_idx = start_idx + chunk_idx
-                    x_hex = hex(limbs_to_int_np(fx_np[chunk_idx]))
-                    d_val = int(fd_np[chunk_idx])
-                    k_type = types_np[global_idx]
+        if len(indices_dp) > 0:
+            curr_x_np = np.array(curr_x)
+            curr_dist_np = np.array(curr_dist)
+            for global_idx in indices_dp:
+                x_hex = hex(limbs_to_int_np(curr_x_np[global_idx]))
+                d_val = int(curr_dist_np[global_idx])
+                k_type = types_np[global_idx]
 
-                    with open(dp_log_filename, "a") as f:
-                        f.write(f"BLOCK:{bloco} | ID:{global_idx} | TYPE:{k_type} | DIST:{d_val} | X:{x_hex}\n")
+                with open(dp_log_filename, "a") as f:
+                    f.write(f"BLOCK:{bloco} | ID:{global_idx} | TYPE:{k_type} | DIST:{d_val} | X:{x_hex}\n")
 
-                    if x_hex in dp_database:
-                        prev_type, prev_dist, prev_id = dp_database[x_hex]
-                        if prev_type != k_type:
-                            print("\n" + "=" * 80)
-                            print("🎉 BINGO! COLISÃO DE PONTO DISTINTO (DP) DETECTADA!")
-                            print("=" * 80)
-                            print(f"📍 Ponto X: {x_hex}")
-                            print(f"🦘 Ponto 1: [{prev_type}] ID {prev_id} | Distância = {prev_dist}")
-                            print(f"🦘 Ponto 2: [{k_type}] ID {global_idx} | Distância = {d_val}")
+                if x_hex in dp_database:
+                    prev_type, prev_dist, prev_id = dp_database[x_hex]
+                    if prev_type != k_type:
+                        print("\n" + "=" * 80)
+                        print("🎉 BINGO! COLISÃO DE PONTO DISTINTO (DP) DETECTADA!")
+                        print("=" * 80)
+                        print(f"📍 Ponto X: {x_hex}")
+                        print(f"🦘 Ponto 1: [{prev_type}] ID {prev_id} | Distância = {prev_dist}")
+                        print(f"🦘 Ponto 2: [{k_type}] ID {global_idx} | Distância = {d_val}")
 
-                            if prev_type == 'TAME':
-                                tame_idx, tame_d = prev_id, prev_dist
-                                wild_idx, wild_d = global_idx - half_n, d_val
-                            else:
-                                tame_idx, tame_d = global_idx, d_val
-                                wild_idx, wild_d = prev_id - half_n, prev_dist
+                        if prev_type == 'TAME':
+                            tame_idx, tame_d = prev_id, prev_dist
+                            wild_idx, wild_d = global_idx - half_n, d_val
+                        else:
+                            tame_idx, tame_d = global_idx, d_val
+                            wild_idx, wild_d = prev_id - half_n, prev_dist
 
-                            tame_init_off = tame_offsets[tame_idx]
-                            wild_init_off = wild_offsets[wild_idx]
+                        tame_init_off = tame_offsets[tame_idx]
+                        wild_init_off = wild_offsets[wild_idx]
 
-                            priv_key_int = (start_int + tame_init_off + tame_d - (wild_init_off + wild_d)) % N_ORDER
-                            priv_key_hex = f"{priv_key_int:064x}"
+                        priv_key_int = (start_int + tame_init_off + tame_d - (wild_init_off + wild_d)) % N_ORDER
+                        priv_key_hex = f"{priv_key_int:064x}"
 
-                            print(f"🔑 CHAVE PRIVADA ENCONTRADA: 0x{priv_key_hex}")
-                            print(f"💾 Resultado gravado em RESULTS.TXT")
-                            with open("RESULTS.TXT", "a") as rf:
-                                rf.write(f"Puzzle #{args.range} Solved! Private Key: {priv_key_hex} | X: {x_hex}\n")
-                            print("=" * 80)
-                            sys.exit(0)
-                    else:
-                        dp_database[x_hex] = (k_type, d_val, global_idx)
-
-        curr_x = jnp.vstack(next_x_chunks)
-        curr_y = jnp.vstack(next_y_chunks)
-        curr_dist = jnp.concatenate(next_dist_chunks)
+                        print(f"🔑 CHAVE PRIVADA ENCONTRADA: 0x{priv_key_hex}")
+                        print(f"💾 Resultado gravado em RESULTS.TXT")
+                        with open("RESULTS.TXT", "a") as rf:
+                            rf.write(f"Puzzle #{args.range} Solved! Private Key: {priv_key_hex} | X: {x_hex}\n")
+                        print("=" * 80)
+                        sys.exit(0)
+                else:
+                    dp_database[x_hex] = (k_type, d_val, global_idx)
 
         t_elapsed = time.time() - t_start
         total_ops = N * bloco * steps_per_block
