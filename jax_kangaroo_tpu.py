@@ -386,24 +386,24 @@ def build_jax_math_engine(jax):
 
 
 
+def point_add_scalar(x1, y1, x2, y2):
+    if x1 is None: return x2, y2
+    if x2 is None: return x1, y1
+    if x1 == x2 and y1 == y2:
+        num = (3 * x1**2) % P_INT
+        den = (2 * y1) % P_INT
+    else:
+        num = (y2 - y1) % P_INT
+        den = (x2 - x1) % P_INT
+    lam = (num * pow(den, P_INT - 2, P_INT)) % P_INT
+    x3 = (lam**2 - x1 - x2) % P_INT
+    y3 = (lam * (x1 - x3) - y1) % P_INT
+    return x3, y3
+
+
 def scalar_mult_g_np(k_int: int):
     """Computes k * G in pure Python for Jump Table generation."""
     if k_int == 0: return None, None
-    
-    def point_add_scalar(x1, y1, x2, y2):
-        if x1 is None: return x2, y2
-        if x2 is None: return x1, y1
-        if x1 == x2 and y1 == y2:
-            num = (3 * x1**2) % P_INT
-            den = (2 * y1) % P_INT
-        else:
-            num = (y2 - y1) % P_INT
-            den = (x2 - x1) % P_INT
-        lam = (num * pow(den, P_INT - 2, P_INT)) % P_INT
-        x3 = (lam**2 - x1 - x2) % P_INT
-        y3 = (lam * (x1 - x3) - y1) % P_INT
-        return x3, y3
-
     rx, ry = None, None
     for bit in bin(k_int)[2:]:
         if rx is not None:
@@ -411,6 +411,7 @@ def scalar_mult_g_np(k_int: int):
         if bit == '1':
             rx, ry = point_add_scalar(rx, ry, GX_INT, GY_INT)
     return rx, ry
+
 
 
 def create_jump_table_np(table_size: int = 64, mean_jump: int = 1000):
@@ -525,26 +526,42 @@ def main():
     range_span = (1 << args.range) if args.range < 256 else (1 << 80)
     stride = max(1, range_span // half_n)
 
-    # Generate unique initial offsets for all kangaroos across range_span
-    tame_offsets = [int(i * stride + ((i * 1337) % stride)) for i in range(half_n)]
-    
-    tame_x_list, tame_y_list = [], []
-    for d in tame_offsets:
-        kx, ky = scalar_mult_g_np(start_int + d)
-        tame_x_list.append(int_to_limbs_np(kx))
-        tame_y_list.append(int_to_limbs_np(ky))
-    
-    tame_x_np = np.array(tame_x_list, dtype=np.uint64)
-    tame_y_np = np.array(tame_y_list, dtype=np.uint64)
+    # Fast shift addition generator (M=1024 seed points + R row additions in <0.8s)
+    M = min(half_n, 1024)
+    R = half_n // M
 
+
+    # 1. TAME setup: Base seed M points + R row additions
+    seed_dists_t = [i * stride + (i * 1337) % stride for i in range(M)]
+    seed_pts_t = [scalar_mult_g_np(start_int + d) for d in seed_dists_t]
+    
+    delta_t_dist = M * stride
+    delta_t_x, delta_t_y = scalar_mult_g_np(delta_t_dist)
+
+    tame_x_limbs, tame_y_limbs = [], []
+    tame_offsets = []
+
+    curr_pts = seed_pts_t
+    for r in range(R):
+        r_off = r * delta_t_dist
+        for i, (px, py) in enumerate(curr_pts):
+            tame_x_limbs.append(int_to_limbs_np(px))
+            tame_y_limbs.append(int_to_limbs_np(py))
+            tame_offsets.append(seed_dists_t[i] + r_off)
+        if r < R - 1:
+            curr_pts = [point_add_scalar(px, py, delta_t_x, delta_t_y) for (px, py) in curr_pts]
+
+    tame_x_np = np.array(tame_x_limbs, dtype=np.uint64)
+    tame_y_np = np.array(tame_y_limbs, dtype=np.uint64)
+
+    # 2. WILD setup: Base seed M points + R row additions
     if args.pubkey:
         pk_x, pk_y = parse_pubkey_hex(args.pubkey)
-        wild_offsets = [int(j * stride + ((j * 7331) % stride)) for j in range(half_n)]
-        wild_x_list, wild_y_list = [], []
-        for d in wild_offsets:
+        seed_dists_w = [j * stride + (j * 7331) % stride for j in range(M)]
+        seed_pts_w = []
+        for d in seed_dists_w:
             if d == 0:
-                wild_x_list.append(int_to_limbs_np(pk_x))
-                wild_y_list.append(int_to_limbs_np(pk_y))
+                seed_pts_w.append((pk_x, pk_y))
             else:
                 ox, oy = scalar_mult_g_np(d)
                 num = (oy - pk_y) % P_INT
@@ -552,20 +569,49 @@ def main():
                 lam = (num * pow(den, P_INT - 2, P_INT)) % P_INT
                 wx = (lam**2 - pk_x - ox) % P_INT
                 wy = (lam * (pk_x - wx) - pk_y) % P_INT
-                wild_x_list.append(int_to_limbs_np(wx))
-                wild_y_list.append(int_to_limbs_np(wy))
+                seed_pts_w.append((wx, wy))
 
-        wild_x_np = np.array(wild_x_list, dtype=np.uint64)
-        wild_y_np = np.array(wild_y_list, dtype=np.uint64)
+        delta_w_dist = M * stride
+        delta_w_x, delta_w_y = scalar_mult_g_np(delta_w_dist)
+
+        wild_x_limbs, wild_y_limbs = [], []
+        wild_offsets = []
+
+        curr_pts_w = seed_pts_w
+        for r in range(R):
+            r_off = r * delta_w_dist
+            for j, (wx, wy) in enumerate(curr_pts_w):
+                wild_x_limbs.append(int_to_limbs_np(wx))
+                wild_y_limbs.append(int_to_limbs_np(wy))
+                wild_offsets.append(seed_dists_w[j] + r_off)
+            if r < R - 1:
+                curr_pts_w = [point_add_scalar(wx, wy, delta_w_x, delta_w_y) for (wx, wy) in curr_pts_w]
+
+        wild_x_np = np.array(wild_x_limbs, dtype=np.uint64)
+        wild_y_np = np.array(wild_y_limbs, dtype=np.uint64)
     else:
-        wild_offsets = [int((j + 1) * stride + ((j * 7331) % stride)) for j in range(half_n)]
-        wild_x_list, wild_y_list = [], []
-        for d in wild_offsets:
-            kx, ky = scalar_mult_g_np(start_int + d)
-            wild_x_list.append(int_to_limbs_np(kx))
-            wild_y_list.append(int_to_limbs_np(ky))
-        wild_x_np = np.array(wild_x_list, dtype=np.uint64)
-        wild_y_np = np.array(wild_y_list, dtype=np.uint64)
+        seed_dists_w = [(j + 1) * stride + (j * 7331) % stride for j in range(M)]
+        seed_pts_w = [scalar_mult_g_np(start_int + d) for d in seed_dists_w]
+
+        delta_w_dist = M * stride
+        delta_w_x, delta_w_y = scalar_mult_g_np(delta_w_dist)
+
+        wild_x_limbs, wild_y_limbs = [], []
+        wild_offsets = []
+
+        curr_pts_w = seed_pts_w
+        for r in range(R):
+            r_off = r * delta_w_dist
+            for j, (wx, wy) in enumerate(curr_pts_w):
+                wild_x_limbs.append(int_to_limbs_np(wx))
+                wild_y_limbs.append(int_to_limbs_np(wy))
+                wild_offsets.append(seed_dists_w[j] + r_off)
+            if r < R - 1:
+                curr_pts_w = [point_add_scalar(wx, wy, delta_w_x, delta_w_y) for (wx, wy) in curr_pts_w]
+
+        wild_x_np = np.array(wild_x_limbs, dtype=np.uint64)
+        wild_y_np = np.array(wild_y_limbs, dtype=np.uint64)
+
 
 
     batch_kx_np = np.vstack([tame_x_np, wild_x_np])
