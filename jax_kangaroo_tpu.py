@@ -629,9 +629,10 @@ def main():
             next_y_chunks.append(ny)
             next_dist_chunks.append(nd)
 
-            # Evaluate native TPU DP boolean mask for this micro-batch
-            dp_flags = np.asarray(is_dp)
+            # Force TPU-to-Host CPU sync using block_until_ready() for reliable DP mask evaluation
+            dp_flags = np.array(is_dp.block_until_ready())
             dp_indices = np.where(dp_flags)[0]
+
 
             if len(dp_indices) > 0:
                 for chunk_idx in dp_indices:
