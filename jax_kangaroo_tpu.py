@@ -408,7 +408,7 @@ def scalar_mult_g_np(k_int: int):
     return rx, ry
 
 
-def create_jump_table_np(table_size: int = 32, mean_jump: int = 1000):
+def create_jump_table_np(table_size: int = 64, mean_jump: int = 1000):
     """Generates a static deterministic Jump Table of N points (J_i = d_i * G)."""
     dists = [max(1, int(mean_jump * (1.4 ** (i - table_size // 2)))) for i in range(table_size)]
     table_x = np.zeros((table_size, 8), dtype=np.uint64)
@@ -425,7 +425,6 @@ def create_jump_table_np(table_size: int = 32, mean_jump: int = 1000):
 
 
 def parse_pubkey_hex(pubkey_str: str):
-
     """Decompresses compressed (02/03) or uncompressed (04) SEC public key to (X, Y) integers."""
     pubkey_str = pubkey_str.strip().lower()
     if pubkey_str.startswith('02') or pubkey_str.startswith('03'):
@@ -446,14 +445,14 @@ def parse_pubkey_hex(pubkey_str: str):
 
 def main():
     parser = argparse.ArgumentParser(description="JAX TPU Pollard's Kangaroo Solver for secp256k1")
-    parser.add_argument('--range', type=int, default=80, help="Puzzle bit range (e.g. 40, 70, 80, 140)")
+    parser.add_argument('--range', type=int, default=80, help="Puzzle bit range (e.g. 40, 60, 80, 140)")
     parser.add_argument('--backend', type=str, default='cpu', choices=['cpu', 'gpu', 'tpu'], help="Hardware backend (tpu, gpu, cpu)")
     parser.add_argument('--pubkey', type=str, default=None, help="Target public key in hex (compressed 02/03... or uncompressed 04...)")
     parser.add_argument('--start', type=str, default="80000000000000000000", help="Start offset hex of the range")
     parser.add_argument('--kangaroos', type=int, default=1024, help="Number of parallel kangaroos per tensor batch")
     parser.add_argument('--dp-bits', type=int, default=16, help="Distinguished point bits")
-    parser.add_argument('--steps', type=int, default=10, help="Benchmark jump steps to perform")
-    parser.add_argument('--jump-table-size', type=int, default=32, choices=[32, 64], help="Jump table size (32 or 64)")
+    parser.add_argument('--steps', type=int, default=0, help="Steps to run (0 for infinite loop)")
+    parser.add_argument('--jump-table-size', type=int, default=64, choices=[32, 64, 128], help="Jump table size (32, 64 or 128)")
     args = parser.parse_args()
 
     print("================================================================================")
@@ -498,11 +497,12 @@ def main():
         sys.exit(1)
 
     # --------------------------------------------------------------------------
-    # PREPARE JUMP TABLE
+    # PREPARE JUMP TABLE (DYNAMIC MEAN JUMP FOR RANGE)
     # --------------------------------------------------------------------------
-    print(f"\n📋 Building Static Jump Table ({args.jump_table_size} points)...")
+    mean_jump = max(100, int(0.5 * (2 ** (args.range / 2))))
+    print(f"\n📋 Building Static Jump Table ({args.jump_table_size} points, Mean Jump ~2^{np.log2(mean_jump):.1f})...")
     t_jt_start = time.time()
-    tx_np, ty_np, td_np = create_jump_table_np(args.jump_table_size)
+    tx_np, ty_np, td_np = create_jump_table_np(args.jump_table_size, mean_jump=mean_jump)
     
     tx_jax = jnp.array(tx_np, dtype=jnp.uint64)
     ty_jax = jnp.array(ty_np, dtype=jnp.uint64)
@@ -510,33 +510,39 @@ def main():
     print(f"✅ Jump Table generated in {time.time() - t_jt_start:.4f}s")
 
     # --------------------------------------------------------------------------
-    # BENCHMARK & SOLVER INITIALIZATION: TAME & WILD KANGAROOS
+    # BENCHMARK & SOLVER INITIALIZATION: WIDE ENTROPY SPACING
     # --------------------------------------------------------------------------
     N = args.kangaroos
     half_n = N // 2
     print(f"\n🚀 Preparing Tensor Batch of {N:,} Kangaroos ({half_n} TAME + {N - half_n} WILD)...")
     
     start_int = int(args.start, 16) if args.start else 1
+    range_span = (1 << args.range) if args.range < 256 else (1 << 80)
+    stride = max(1, range_span // half_n)
 
+    tame_offsets = []
+    wild_offsets = []
     tame_x_list, tame_y_list = [], []
     wild_x_list, wild_y_list = [], []
-    
-    # Tame kangaroos start at (start_int + i * 100) * G
+
+    # Initialize Tame kangaroos widely distributed across search space
     for i in range(half_n):
-        kx, ky = scalar_mult_g_np(start_int + i * 100)
+        off = i * stride + (i * 1337) % stride
+        tame_offsets.append(off)
+        kx, ky = scalar_mult_g_np(start_int + off)
         tame_x_list.append(kx)
         tame_y_list.append(ky)
 
     if args.pubkey:
-        # Wild kangaroos start at Pubkey + (j * 100) * G
         pk_x, pk_y = parse_pubkey_hex(args.pubkey)
         for j in range(N - half_n):
-            if j == 0:
+            off = j * stride + (j * 7331) % stride
+            wild_offsets.append(off)
+            if off == 0:
                 wild_x_list.append(pk_x)
                 wild_y_list.append(pk_y)
             else:
-                ox, oy = scalar_mult_g_np(j * 100)
-                # Pubkey + (j * 100) * G via Python scalar point addition
+                ox, oy = scalar_mult_g_np(off)
                 num = (oy - pk_y) % P_INT
                 den = (ox - pk_x) % P_INT
                 lam = (num * pow(den, P_INT - 2, P_INT)) % P_INT
@@ -545,9 +551,10 @@ def main():
                 wild_x_list.append(wx)
                 wild_y_list.append(wy)
     else:
-        # Default benchmark wild offset if no pubkey passed
         for j in range(N - half_n):
-            kx, ky = scalar_mult_g_np(start_int + (j + 1) * 1000)
+            off = (j + 1) * stride + (j * 7331) % stride
+            wild_offsets.append(off)
+            kx, ky = scalar_mult_g_np(start_int + off)
             wild_x_list.append(kx)
             wild_y_list.append(ky)
 
@@ -572,7 +579,7 @@ def main():
     test_nx.block_until_ready()
     print(f"✅ Jump Step JIT Compilation completed in {time.time() - t_jit_jump:.4f}s")
 
-    print(f"🔥 Executing {args.steps} parallel jump steps across {N:,} kangaroos...")
+    print(f"🔥 Executing parallel jump steps across {N:,} kangaroos...")
     
     # --------------------------------------------------------------------------
     # DISTINGUISHED POINTS (DP) & COLLISION TRACKER
@@ -583,7 +590,6 @@ def main():
     
     types_np = np.array(['TAME'] * half_n + ['WILD'] * (N - half_n))
 
-    # DP database: maps X_hex -> (type, distance_int, kangaroo_id)
     dp_database = {}
     dp_log_filename = "dp_database.log"
     dp_count = 0
@@ -624,14 +630,17 @@ def main():
                         print(f"🦘 Ponto 2: [{k_type}] ID {idx} | Distância = {d_val}")
 
                         if prev_type == 'TAME':
-                            tame_id, tame_d = prev_id, prev_dist
-                            wild_id, wild_d = idx - half_n, d_val
+                            tame_idx, tame_d = prev_id, prev_dist
+                            wild_idx, wild_d = idx - half_n, d_val
                         else:
-                            tame_id, tame_d = idx, d_val
-                            wild_id, wild_d = prev_id - half_n, prev_dist
+                            tame_idx, tame_d = idx, d_val
+                            wild_idx, wild_d = prev_id - half_n, prev_dist
 
-                        # Private Key = start_int + tame_offset + tame_dist - (wild_offset + wild_dist)
-                        priv_key_int = (start_int + tame_id * 100 + tame_d - (wild_id * 100 + wild_d)) % P_INT
+                        tame_init_off = tame_offsets[tame_idx]
+                        wild_init_off = wild_offsets[wild_idx]
+
+                        # Private Key = start_int + tame_init_off + tame_d - (wild_init_off + wild_d)
+                        priv_key_int = (start_int + tame_init_off + tame_d - (wild_init_off + wild_d)) % P_INT
                         priv_key_hex = f"{priv_key_int:064x}"
 
                         print(f"🔑 CHAVE PRIVADA ENCONTRADA: 0x{priv_key_hex}")
@@ -653,6 +662,7 @@ def main():
         # If finite steps requested, exit after reaching limit
         if args.steps > 0 and step >= args.steps:
             break
+
 
     curr_x.block_until_ready()
     t_end = time.time() - t_start
