@@ -481,7 +481,7 @@ def main():
     parser.add_argument('--dp-bits', type=int, default=None, help="Distinguished point bits (auto-recommended targeting 500-1000 DPs/step if not specified)")
     parser.add_argument('--steps', type=int, default=0, help="Steps to run (0 for infinite loop)")
     parser.add_argument('--jump-table-size', type=int, default=64, choices=[32, 64, 128], help="Jump table size (32, 64 or 128)")
-    parser.add_argument('--inner-steps', type=int, default=100, help="TPU hardware inner unrolled steps per cycle (default: 100)")
+    parser.add_argument('--inner-steps', type=int, default=10, help="TPU hardware inner unrolled steps per cycle (default: 10)")
     args = parser.parse_args()
 
     print("================================================================================")
@@ -704,7 +704,7 @@ def main():
         print(f"🎯 Distinguished Points (DP) ativado: Lowest {dp_bits} bits masked (0x{(1 << dp_bits) - 1:X}, ~{expected_dps:,} DPs por passo)")
 
     dp_mask = jnp.uint64((1 << dp_bits) - 1)
-    steps_per_block = args.inner_steps if args.inner_steps > 0 else 100
+    steps_per_block = args.inner_steps if args.inner_steps > 0 else 10
     MB = min(N, 1048576)
     print(f"⚡ JIT Compiling Unrolled Scan Kangaroo Jump Kernel ({steps_per_block:,} TPU inner steps/block)...")
     t_jit_jump = time.time()
