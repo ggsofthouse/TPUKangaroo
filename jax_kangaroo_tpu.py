@@ -693,8 +693,8 @@ def main():
 
 
     if args.dp_bits is None or args.dp_bits <= 0:
-        # Target 500-1000 DPs per step: dp_bits = log2(N) - 9
-        rec_bits = max(4, min(32, int(math.log2(N)) - 9))
+        # Target ~8 DPs per step (log2(N) - 3) to keep Host CPU dictionary overhead at 0.00001s
+        rec_bits = max(4, min(32, int(math.log2(N)) - 3))
         dp_bits = rec_bits
         expected_dps = max(1, N // (1 << dp_bits))
         print(f"💡 recomendação automática ativada: --dp-bits={dp_bits} (Densidade Alvo: ~{expected_dps:,} DPs por passo)")
@@ -706,15 +706,15 @@ def main():
     dp_mask = jnp.uint64((1 << dp_bits) - 1)
     steps_per_block = args.inner_steps if args.inner_steps > 0 else 10
     MB = min(N, 1048576)
-    print(f"⚡ JIT Compiling Unrolled Scan Kangaroo Jump Kernel ({steps_per_block:,} TPU inner steps/block)...")
+    print(f"⚡ JIT Compiling Vectorized Kangaroo Jump Step (Micro-Batch Size: {MB:,})...")
     t_jit_jump = time.time()
-    test_fx, test_fy, test_fd, test_dp = engine["scan_jump_block"](
-        batch_kx[:MB], batch_ky[:MB], batch_dist[:MB], tx_jax, ty_jax, td_jax, dp_mask, steps_per_block
+    test_nx, test_ny, test_nd, test_dp = engine["jump_step"](
+        batch_kx[:MB], batch_ky[:MB], batch_dist[:MB], tx_jax, ty_jax, td_jax, dp_mask
     )
-    test_fx.block_until_ready()
-    print(f"✅ Unrolled Scan TPU Jump Kernel JIT Compilation completed in {time.time() - t_jit_jump:.4f}s")
+    test_nx.block_until_ready()
+    print(f"✅ Jump Step JIT Compilation completed in {time.time() - t_jit_jump:.4f}s")
 
-    print(f"🔥 Executing unrolled scan jump blocks across {N:,} kangaroos ({steps_per_block:,} saltos/bloco)...")
+    print(f"🔥 Executing parallel jump steps across {N:,} kangaroos in chunks of {MB:,}...")
 
     types_np = np.array(['TAME'] * half_n + ['WILD'] * (N - half_n))
 
@@ -724,46 +724,42 @@ def main():
 
     t_start = time.time()
     curr_x, curr_y, curr_dist = batch_kx, batch_ky, batch_dist
-    block = 0
+    step = 0
 
     while True:
-        block += 1
+        step += 1
         
-        # Step through micro-batches using unrolled hardware scan block
+        # Step through micro-batches
         next_x_chunks, next_y_chunks, next_dist_chunks = [], [], []
         for start_idx in range(0, N, MB):
             end_idx = min(start_idx + MB, N)
-            fx, fy, fd, dp_stack = engine["scan_jump_block"](
+            nx, ny, nd, is_dp = engine["jump_step"](
                 curr_x[start_idx:end_idx],
                 curr_y[start_idx:end_idx],
                 curr_dist[start_idx:end_idx],
                 tx_jax, ty_jax, td_jax,
-                dp_mask,
-                steps_per_block
+                dp_mask
             )
-            next_x_chunks.append(fx)
-            next_y_chunks.append(fy)
-            next_dist_chunks.append(fd)
+            next_x_chunks.append(nx)
+            next_y_chunks.append(ny)
+            next_dist_chunks.append(nd)
 
-            # Evaluate any DP hits recorded during the steps_per_block iterations
-            dp_flags_np = np.array(dp_stack.block_until_ready())
-            step_indices, chunk_indices = np.where(dp_flags_np)
+            dp_flags = np.array(is_dp.block_until_ready())
+            dp_indices = np.where(dp_flags)[0]
 
-            if len(step_indices) > 0:
-                fx_np = np.array(fx)
-                fd_np = np.array(fd)
-                unique_c_indices = np.unique(chunk_indices)
-
-                for c_idx in unique_c_indices:
-                    global_idx = start_idx + c_idx
-                    x_hex = hex(limbs_to_int_np(fx_np[c_idx]))
-                    d_val = int(fd_np[c_idx])
+            if len(dp_indices) > 0:
+                nx_np = np.array(nx)
+                nd_np = np.array(nd)
+                for chunk_idx in dp_indices:
+                    global_idx = start_idx + chunk_idx
+                    x_hex = hex(limbs_to_int_np(nx_np[chunk_idx]))
+                    d_val = int(nd_np[chunk_idx])
                     k_type = types_np[global_idx]
                     dp_count += 1
 
                     # Log DP to log file
                     with open(dp_log_filename, "a") as f:
-                        f.write(f"BLOCK:{block} | ID:{global_idx} | TYPE:{k_type} | DIST:{d_val} | X:{x_hex}\n")
+                        f.write(f"STEP:{step} | ID:{global_idx} | TYPE:{k_type} | DIST:{d_val} | X:{x_hex}\n")
 
                     # Check Collision
                     if x_hex in dp_database:
@@ -803,11 +799,11 @@ def main():
         curr_dist = jnp.concatenate(next_dist_chunks)
 
         t_elapsed = time.time() - t_start
-        total_ops = N * block * steps_per_block
+        total_ops = N * step
         rate = total_ops / t_elapsed
-        print(f"⏱️ Bloco {block:,} ({block * steps_per_block:,} saltos/canguru) | Saltos Totais: {total_ops:,} | Velocidade: {rate/1e6:.4f} Mops/s ({rate/1e3:.2f} Kops/s) | DPs: {dp_count:,}")
+        print(f"⏱️ Passo {step:,} | Saltos Totais: {total_ops:,} | Velocidade: {rate/1e6:.4f} Mops/s ({rate/1e3:.2f} Kops/s) | DPs Capturados: {dp_count:,}")
 
-        if args.steps > 0 and (block * steps_per_block) >= args.steps:
+        if args.steps > 0 and step >= args.steps:
             break
 
     curr_x.block_until_ready()
