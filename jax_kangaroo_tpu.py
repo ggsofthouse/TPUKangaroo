@@ -581,13 +581,14 @@ def main():
     batch_dist = jnp.zeros((N,), dtype=jnp.uint64)
 
 
-    print("⚡ JIT Compiling Vectorized Kangaroo Jump Step...")
+    MB = min(N, 16384)
+    print(f"⚡ JIT Compiling Vectorized Kangaroo Jump Step (Micro-Batch Size: {MB:,})...")
     t_jit_jump = time.time()
-    test_nx, test_ny, test_nd = engine["jump_step"](batch_kx, batch_ky, batch_dist, tx_jax, ty_jax, td_jax)
+    test_nx, test_ny, test_nd = engine["jump_step"](batch_kx[:MB], batch_ky[:MB], batch_dist[:MB], tx_jax, ty_jax, td_jax)
     test_nx.block_until_ready()
     print(f"✅ Jump Step JIT Compilation completed in {time.time() - t_jit_jump:.4f}s")
 
-    print(f"🔥 Executing parallel jump steps across {N:,} kangaroos...")
+    print(f"🔥 Executing parallel jump steps across {N:,} kangaroos in chunks of {MB:,}...")
     
     # --------------------------------------------------------------------------
     # DISTINGUISHED POINTS (DP) & COLLISION TRACKER
@@ -608,11 +609,29 @@ def main():
 
     while True:
         step += 1
-        curr_x, curr_y, curr_dist = engine["jump_step"](curr_x, curr_y, curr_dist, tx_jax, ty_jax, td_jax)
+        
+        # Step through micro-batches
+        next_x_chunks, next_y_chunks, next_dist_chunks = [], [], []
+        for start_idx in range(0, N, MB):
+            end_idx = min(start_idx + MB, N)
+            nx, ny, nd = engine["jump_step"](
+                curr_x[start_idx:end_idx],
+                curr_y[start_idx:end_idx],
+                curr_dist[start_idx:end_idx],
+                tx_jax, ty_jax, td_jax
+            )
+            next_x_chunks.append(nx)
+            next_y_chunks.append(ny)
+            next_dist_chunks.append(nd)
+
+        curr_x = jnp.vstack(next_x_chunks)
+        curr_y = jnp.vstack(next_y_chunks)
+        curr_dist = jnp.concatenate(next_dist_chunks)
         
         # Check DP condition across batch: (curr_x[..., 0] & dp_mask) == 0
         dp_flags = np.array((curr_x[..., 0] & dp_mask) == 0)
         dp_indices = np.where(dp_flags)[0]
+
 
         if len(dp_indices) > 0:
             for idx in dp_indices:
