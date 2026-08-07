@@ -308,8 +308,44 @@ def build_jax_math_engine(jax):
         (final_res, _), _ = jax.lax.scan(step_fn, (init_res, a), p_bits_jax)
         return final_res
 
+    @jax.jit
+    def batch_inverse_mod_p(a_batch: jnp.ndarray) -> jnp.ndarray:
+        """
+        Montgomery's batch (simultaneous) modular inversion.
+        Input:  a_batch shape (N, 8)
+        Output: shape (N, 8) -- a_batch[i]^-1 mod P
+        Cost: ~3N multiplications + 1 Fermat inversion (~256 mults) instead of N * 256 mults!
+        """
+        one_limbs = jnp.array([1, 0, 0, 0, 0, 0, 0, 0], dtype=jnp.uint64)
 
+        is_zero = jnp.all(a_batch == 0, axis=-1)
+        safe_a = jnp.where(
+            is_zero[:, None], jnp.broadcast_to(one_limbs, a_batch.shape), a_batch
+        )
 
+        def prefix_step(running_prod, a_i):
+            new_prod = mul_256_mod_p(running_prod, a_i)
+            return new_prod, new_prod
+
+        total_prod, prefix_products = jax.lax.scan(prefix_step, one_limbs, safe_a)
+        total_inv = inv_mod_p(total_prod[None, :])[0]
+
+        prefix_shifted = jnp.concatenate(
+            [one_limbs[None, :], prefix_products[:-1]], axis=0
+        )
+
+        def backward_step(running_inv, elems):
+            a_i, pref_i = elems
+            inv_i = mul_256_mod_p(running_inv, pref_i)
+            next_running_inv = mul_256_mod_p(running_inv, a_i)
+            return next_running_inv, inv_i
+
+        _, inv_batch = jax.lax.scan(
+            backward_step, total_inv, (safe_a, prefix_shifted), reverse=True
+        )
+
+        inv_batch = jnp.where(is_zero[:, None], jnp.zeros_like(a_batch), inv_batch)
+        return inv_batch
 
     # --------------------------------------------------------------------------
     # 4. ECC POINT ADDITION AND DOUBLING (secp256k1)
@@ -319,7 +355,7 @@ def build_jax_math_engine(jax):
         """Vectorized Affine Point Addition: (X3, Y3) = (X1, Y1) + (X2, Y2)."""
         dy = sub_256_raw(y2, y1)
         dx = sub_256_raw(x2, x1)
-        dx_inv = inv_mod_p(dx)
+        dx_inv = batch_inverse_mod_p(dx)
         lam = mul_256_mod_p(dy, dx_inv)
 
         lam2 = mul_256_mod_p(lam, lam)
@@ -338,7 +374,7 @@ def build_jax_math_engine(jax):
 
         two_limbs = jnp.array([2, 0, 0, 0, 0, 0, 0, 0], dtype=jnp.uint64)
         den = mul_256_mod_p(y1, jnp.broadcast_to(two_limbs, y1.shape))
-        den_inv = inv_mod_p(den)
+        den_inv = batch_inverse_mod_p(den)
         lam = mul_256_mod_p(num, den_inv)
 
         lam2 = mul_256_mod_p(lam, lam)
@@ -407,6 +443,7 @@ def build_jax_math_engine(jax):
         "sub_256": sub_256_raw,
         "mul_256": mul_256_mod_p,
         "inv_mod_p": inv_mod_p,
+        "batch_inverse_mod_p": batch_inverse_mod_p,
         "ecc_add": ecc_add_affine,
         "ecc_double": ecc_double_affine,
         "jump_step": kangaroo_jump_step,
@@ -530,6 +567,26 @@ def main():
         print("🎉 SECP256K1 POINT DOUBLING MATEMATICAMENTE PERFEITO!")
     else:
         print("❌ ERRO NA VERIFICAÇÃO MATEMÁTICA!")
+        sys.exit(1)
+
+    # --------------------------------------------------------------------------
+    # VALIDATION TEST 2: Montgomery Batch Inversion Self-Test
+    # --------------------------------------------------------------------------
+    print("⚡ JIT Compiling Montgomery Batch Inversion Self-Test (37 random values)...")
+    import random
+    test_vals = [random.randint(1, P_INT - 1) for _ in range(37)]
+
+    a_np = np.array([int_to_limbs_np(v) for v in test_vals], dtype=np.uint64)
+    a_jax = jnp.array(a_np, dtype=jnp.uint64)
+
+    ref_inv = jnp.stack([engine["inv_mod_p"](a_jax[i:i+1])[0] for i in range(len(test_vals))])
+    fast_inv = engine["batch_inverse_mod_p"](a_jax)
+
+    ok = bool(jnp.all(ref_inv == fast_inv))
+    if ok:
+        print("🎉 MONTGOMERY BATCH INVERSION MATEMATICAMENTE PERFEITA (PASSOU ✅)!")
+    else:
+        print("❌ ERRO NA INVERSÃO EM LOTE DE MONTGOMERY!")
         sys.exit(1)
 
     # --------------------------------------------------------------------------
@@ -800,12 +857,12 @@ def main():
     curr_x.block_until_ready()
     t_end = time.time() - t_start
     
-    total_ops = N * block * steps_per_block
+    total_ops = N * bloco * steps_per_block
     rate = total_ops / t_end
     print("================================================================================")
-    print(f"⏱️ Finalizado {block:,} blocos ({block * steps_per_block:,} saltos/canguru) em {t_end:.4f} segundos")
+    print(f"⏱️ Finalizado {bloco:,} blocos ({bloco * steps_per_block:,} saltos/canguru) em {t_end:.4f} segundos")
     print(f"⚡ Throughput Rate: {rate / 1e3:.2f} Kops/sec ({rate / 1e6:.4f} Mops/sec)")
-    print(f"📌 Total de Pontos Distintos (DPs) capturados: {dp_count} (DB size: {len(dp_database)})")
+    print(f"📌 Total de Pontos Distintos (DPs) capturados: {total_dps} (DB size: {len(dp_database)})")
     print("================================================================================")
 
 
