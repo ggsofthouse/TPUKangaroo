@@ -506,7 +506,7 @@ def main():
     # --------------------------------------------------------------------------
     # PREPARE JUMP TABLE (DYNAMIC MEAN JUMP FOR RANGE)
     # --------------------------------------------------------------------------
-    mean_jump = min(1 << 44, max(100, int(0.5 * (2 ** (args.range / 2)))))
+    mean_jump = min(1 << 44, max(100, int(2 ** ((args.range - 1) / 2))))
     print(f"\n📋 Building Static Jump Table ({args.jump_table_size} points, Mean Jump ~2^{math.log2(mean_jump):.1f})...")
     t_jt_start = time.time()
     tx_np, ty_np, td_np = create_jump_table_np(args.jump_table_size, mean_jump=mean_jump)
