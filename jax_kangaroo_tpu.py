@@ -525,7 +525,7 @@ def main():
     parser.add_argument('--dp-bits', type=int, default=None, help="Distinguished point bits (auto-recommended targeting 500-1000 DPs/step if not specified)")
     parser.add_argument('--steps', type=int, default=0, help="Steps to run (0 for infinite loop)")
     parser.add_argument('--jump-table-size', type=int, default=64, choices=[32, 64, 128], help="Jump table size (32, 64 or 128)")
-    parser.add_argument('--inner-steps', type=int, default=500, help="TPU hardware inner unrolled steps per cycle (default: 500)")
+    parser.add_argument('--inner-steps', type=int, default=10, help="TPU hardware inner unrolled steps per cycle (default: 10)")
     args = parser.parse_args()
 
     print("================================================================================")
@@ -770,7 +770,7 @@ def main():
         print(f"🎯 Distinguished Points (DP) ativado: Lowest {dp_bits} bits masked (0x{(1 << dp_bits) - 1:X}, ~{expected_dps:,} DPs por passo)")
 
     dp_mask = jnp.uint64((1 << dp_bits) - 1)
-    steps_per_block = args.inner_steps if args.inner_steps > 0 else 500
+    steps_per_block = args.inner_steps if args.inner_steps > 0 else 10
     print(f"🔥 MÁXIMA FORÇA ATIVADA: JIT Compilando blocos de {steps_per_block:,} saltos confinados...")
     t_jit_jump = time.time()
     test_fx, test_fy, test_fd, test_dp = engine["tpu_conconfined_loop"](
