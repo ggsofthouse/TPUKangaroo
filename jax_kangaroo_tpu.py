@@ -527,8 +527,8 @@ def main():
     range_span = (1 << args.range) if args.range < 256 else (1 << 80)
     stride = max(1, range_span // half_n)
 
-    # Fast shift addition generator (M=1024 seed points + R row additions in <0.8s)
-    M = min(half_n, 1024)
+    # Fast shift addition generator (M seed points + R row additions capped at R=64 for instant setup in <1.5s)
+    M = max(1024, half_n // 64)
     R = half_n // M
 
 
@@ -627,7 +627,7 @@ def main():
     print(f"🎯 Distinguished Points (DP) active: Lowest {dp_bits} bits masked (0x{dp_mask:X})")
 
     # Micro-batch size optimized for TPU HBM and minimum host RPC overhead
-    MB = min(N, 262144)
+    MB = min(N, 1048576)
     print(f"⚡ JIT Compiling Vectorized Kangaroo Jump Step (Micro-Batch Size: {MB:,})...")
     t_jit_jump = time.time()
     test_nx, test_ny, test_nd, test_dp = engine["jump_step"](batch_kx[:MB], batch_ky[:MB], batch_dist[:MB], tx_jax, ty_jax, td_jax, dp_mask)
