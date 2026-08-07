@@ -351,7 +351,8 @@ def build_jax_math_engine(jax):
     # --------------------------------------------------------------------------
     @jax.jit
     def kangaroo_jump_step(curr_x: jnp.ndarray, curr_y: jnp.ndarray, curr_dist: jnp.ndarray,
-                           table_x: jnp.ndarray, table_y: jnp.ndarray, table_dists: jnp.ndarray):
+                           table_x: jnp.ndarray, table_y: jnp.ndarray, table_dists: jnp.ndarray,
+                           dp_mask: jnp.uint64):
         """
         Vectorized jump step for batch of kangaroos shape (Batch, 8) using jnp.take.
         Jump index is chosen by masking LSB of current X coordinate.
@@ -368,7 +369,10 @@ def build_jax_math_engine(jax):
         next_x, next_y = ecc_add_affine(curr_x, curr_y, jump_x, jump_y)
         next_dist = curr_dist + jump_dist
 
-        return next_x, next_y, next_dist
+        # Native TPU DP check
+        is_dp = (next_x[..., 0] & dp_mask) == jnp.uint64(0)
+
+        return next_x, next_y, next_dist, is_dp
 
     return {
         "add_256": add_256_raw,
@@ -379,6 +383,7 @@ def build_jax_math_engine(jax):
         "ecc_double": ecc_double_affine,
         "jump_step": kangaroo_jump_step,
     }
+
 
 
 def scalar_mult_g_np(k_int: int):
@@ -581,21 +586,18 @@ def main():
     batch_dist = jnp.zeros((N,), dtype=jnp.uint64)
 
 
+    dp_bits = args.dp_bits
+    dp_mask = jnp.uint64((1 << dp_bits) - 1)
+    print(f"🎯 Distinguished Points (DP) active: Lowest {dp_bits} bits masked (0x{dp_mask:X})")
+
     MB = min(N, 16384)
     print(f"⚡ JIT Compiling Vectorized Kangaroo Jump Step (Micro-Batch Size: {MB:,})...")
     t_jit_jump = time.time()
-    test_nx, test_ny, test_nd = engine["jump_step"](batch_kx[:MB], batch_ky[:MB], batch_dist[:MB], tx_jax, ty_jax, td_jax)
+    test_nx, test_ny, test_nd, test_dp = engine["jump_step"](batch_kx[:MB], batch_ky[:MB], batch_dist[:MB], tx_jax, ty_jax, td_jax, dp_mask)
     test_nx.block_until_ready()
     print(f"✅ Jump Step JIT Compilation completed in {time.time() - t_jit_jump:.4f}s")
 
     print(f"🔥 Executing parallel jump steps across {N:,} kangaroos in chunks of {MB:,}...")
-    
-    # --------------------------------------------------------------------------
-    # DISTINGUISHED POINTS (DP) & COLLISION TRACKER
-    # --------------------------------------------------------------------------
-    dp_bits = args.dp_bits
-    dp_mask = jnp.uint64((1 << dp_bits) - 1)
-    print(f"🎯 Distinguished Points (DP) active: Lowest {dp_bits} bits masked (0x{dp_mask:X})")
     
     types_np = np.array(['TAME'] * half_n + ['WILD'] * (N - half_n))
 
@@ -614,70 +616,72 @@ def main():
         next_x_chunks, next_y_chunks, next_dist_chunks = [], [], []
         for start_idx in range(0, N, MB):
             end_idx = min(start_idx + MB, N)
-            nx, ny, nd = engine["jump_step"](
+            nx, ny, nd, is_dp = engine["jump_step"](
                 curr_x[start_idx:end_idx],
                 curr_y[start_idx:end_idx],
                 curr_dist[start_idx:end_idx],
-                tx_jax, ty_jax, td_jax
+                tx_jax, ty_jax, td_jax,
+                dp_mask
             )
             next_x_chunks.append(nx)
             next_y_chunks.append(ny)
             next_dist_chunks.append(nd)
 
+            # Evaluate native TPU DP boolean mask for this micro-batch
+            dp_flags = np.asarray(is_dp)
+            dp_indices = np.where(dp_flags)[0]
+
+            if len(dp_indices) > 0:
+                for chunk_idx in dp_indices:
+                    global_idx = start_idx + chunk_idx
+                    x_hex = hex(limbs_to_int_np(nx[chunk_idx]))
+                    y_hex = hex(limbs_to_int_np(ny[chunk_idx]))
+                    d_val = int(nd[chunk_idx])
+                    k_type = types_np[global_idx]
+                    dp_count += 1
+
+                    # Log DP to log file
+                    with open(dp_log_filename, "a") as f:
+                        f.write(f"STEP:{step} | ID:{global_idx} | TYPE:{k_type} | DIST:{d_val} | X:{x_hex}\n")
+
+                    # Check Collision
+                    if x_hex in dp_database:
+                        prev_type, prev_dist, prev_id = dp_database[x_hex]
+                        if prev_type != k_type:
+                            print("\n" + "=" * 80)
+                            print("🎉 BINGO! COLISÃO DE PONTO DISTINTO (DP) DETECTADA!")
+                            print("=" * 80)
+                            print(f"📍 Ponto X: {x_hex}")
+                            print(f"🦘 Ponto 1: [{prev_type}] ID {prev_id} | Distância = {prev_dist}")
+                            print(f"🦘 Ponto 2: [{k_type}] ID {global_idx} | Distância = {d_val}")
+
+                            if prev_type == 'TAME':
+                                tame_idx, tame_d = prev_id, prev_dist
+                                wild_idx, wild_d = global_idx - half_n, d_val
+                            else:
+                                tame_idx, tame_d = global_idx, d_val
+                                wild_idx, wild_d = prev_id - half_n, prev_dist
+
+                            tame_init_off = tame_offsets[tame_idx]
+                            wild_init_off = wild_offsets[wild_idx]
+
+                            # Private Key = start_int + tame_init_off + tame_d - (wild_init_off + wild_d)
+                            priv_key_int = (start_int + tame_init_off + tame_d - (wild_init_off + wild_d)) % P_INT
+                            priv_key_hex = f"{priv_key_int:064x}"
+
+                            print(f"🔑 CHAVE PRIVADA ENCONTRADA: 0x{priv_key_hex}")
+                            print(f"💾 Resultado gravado em RESULTS.TXT")
+                            with open("RESULTS.TXT", "a") as rf:
+                                rf.write(f"Puzzle #{args.range} Solved! Private Key: {priv_key_hex} | X: {x_hex}\n")
+                            print("=" * 80)
+                            sys.exit(0)
+                    else:
+                        dp_database[x_hex] = (k_type, d_val, global_idx)
+
         curr_x = jnp.vstack(next_x_chunks)
         curr_y = jnp.vstack(next_y_chunks)
         curr_dist = jnp.concatenate(next_dist_chunks)
-        
-        # Check DP condition across batch: (curr_x[..., 0] & dp_mask) == 0
-        dp_flags = np.array((curr_x[..., 0] & dp_mask) == 0)
-        dp_indices = np.where(dp_flags)[0]
 
-
-        if len(dp_indices) > 0:
-            for idx in dp_indices:
-                x_hex = hex(limbs_to_int_np(curr_x[idx]))
-                y_hex = hex(limbs_to_int_np(curr_y[idx]))
-                d_val = int(curr_dist[idx])
-                k_type = types_np[idx]
-                dp_count += 1
-
-                # Log DP
-                with open(dp_log_filename, "a") as f:
-                    f.write(f"STEP:{step} | ID:{idx} | TYPE:{k_type} | DIST:{d_val} | X:{x_hex}\n")
-
-                # Check Collision
-                if x_hex in dp_database:
-                    prev_type, prev_dist, prev_id = dp_database[x_hex]
-                    if prev_type != k_type:
-                        print("\n" + "=" * 80)
-                        print("🎉 BINGO! COLISÃO DE PONTO DISTINTO (DP) DETECTADA!")
-                        print("=" * 80)
-                        print(f"📍 Ponto X: {x_hex}")
-                        print(f"🦘 Ponto 1: [{prev_type}] ID {prev_id} | Distância = {prev_dist}")
-                        print(f"🦘 Ponto 2: [{k_type}] ID {idx} | Distância = {d_val}")
-
-                        if prev_type == 'TAME':
-                            tame_idx, tame_d = prev_id, prev_dist
-                            wild_idx, wild_d = idx - half_n, d_val
-                        else:
-                            tame_idx, tame_d = idx, d_val
-                            wild_idx, wild_d = prev_id - half_n, prev_dist
-
-                        tame_init_off = tame_offsets[tame_idx]
-                        wild_init_off = wild_offsets[wild_idx]
-
-                        # Private Key = start_int + tame_init_off + tame_d - (wild_init_off + wild_d)
-                        priv_key_int = (start_int + tame_init_off + tame_d - (wild_init_off + wild_d)) % P_INT
-                        priv_key_hex = f"{priv_key_int:064x}"
-
-                        print(f"🔑 CHAVE PRIVADA ENCONTRADA: 0x{priv_key_hex}")
-                        print(f"💾 Resultado gravado em RESULTS.TXT")
-                        with open("RESULTS.TXT", "a") as rf:
-                            rf.write(f"Puzzle #{args.range} Solved! Private Key: {priv_key_hex} | X: {x_hex}\n")
-                        print("=" * 80)
-                        sys.exit(0)
-                else:
-                    dp_database[x_hex] = (k_type, d_val, idx)
 
         # Dynamic print frequency to show live stats every 1-2 seconds on TPU/GPU
         print_freq = max(1, 1000000 // N)
