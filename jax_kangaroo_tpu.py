@@ -590,7 +590,8 @@ def main():
     dp_mask = jnp.uint64((1 << dp_bits) - 1)
     print(f"🎯 Distinguished Points (DP) active: Lowest {dp_bits} bits masked (0x{dp_mask:X})")
 
-    MB = min(N, 16384)
+    # Micro-batch size optimized for TPU HBM and minimum host RPC overhead
+    MB = min(N, 262144)
     print(f"⚡ JIT Compiling Vectorized Kangaroo Jump Step (Micro-Batch Size: {MB:,})...")
     t_jit_jump = time.time()
     test_nx, test_ny, test_nd, test_dp = engine["jump_step"](batch_kx[:MB], batch_ky[:MB], batch_dist[:MB], tx_jax, ty_jax, td_jax, dp_mask)
@@ -598,6 +599,7 @@ def main():
     print(f"✅ Jump Step JIT Compilation completed in {time.time() - t_jit_jump:.4f}s")
 
     print(f"🔥 Executing parallel jump steps across {N:,} kangaroos in chunks of {MB:,}...")
+
     
     types_np = np.array(['TAME'] * half_n + ['WILD'] * (N - half_n))
 
