@@ -647,14 +647,24 @@ def main():
     tame_x_np = tame_p0_x.copy()
     tame_y_np = tame_p0_y.copy()
 
+    def chunked_ecc_add(p_x_np, p_y_np, q_x_np, q_y_np, chunk_size=65536):
+        num_pts = p_x_np.shape[0]
+        rx_chunks, ry_chunks = [], []
+        for s in range(0, num_pts, chunk_size):
+            e = min(s + chunk_size, num_pts)
+            px_j = jnp.array(p_x_np[s:e], dtype=jnp.uint64)
+            py_j = jnp.array(p_y_np[s:e], dtype=jnp.uint64)
+            qx_j = jnp.array(q_x_np[s:e], dtype=jnp.uint64)
+            qy_j = jnp.array(q_y_np[s:e], dtype=jnp.uint64)
+            rx, ry = engine["ecc_add"](px_j, py_j, qx_j, qy_j)
+            rx_chunks.append(np.array(rx))
+            ry_chunks.append(np.array(ry))
+        return np.vstack(rx_chunks), np.vstack(ry_chunks)
+
     if np.any(mask_t):
-        p_x_j = jnp.array(tame_p0_x[mask_t], dtype=jnp.uint64)
-        p_y_j = jnp.array(tame_p0_y[mask_t], dtype=jnp.uint64)
-        q_x_j = jnp.array(tame_q_x[mask_t], dtype=jnp.uint64)
-        q_y_j = jnp.array(tame_q_y[mask_t], dtype=jnp.uint64)
-        rx_j, ry_j = engine["ecc_add"](p_x_j, p_y_j, q_x_j, q_y_j)
-        tame_x_np[mask_t] = np.array(rx_j)
-        tame_y_np[mask_t] = np.array(ry_j)
+        rx_np, ry_np = chunked_ecc_add(tame_p0_x[mask_t], tame_p0_y[mask_t], tame_q_x[mask_t], tame_q_y[mask_t])
+        tame_x_np[mask_t] = rx_np
+        tame_y_np[mask_t] = ry_np
 
     # 2. WILD SETUP: Base Seed (M=256) + Shift Points (R=half_n//M)
     if args.pubkey:
@@ -700,13 +710,9 @@ def main():
         wild_y_np = wild_p0_y.copy()
 
         if np.any(mask_w):
-            p_wx_j = jnp.array(wild_p0_x[mask_w], dtype=jnp.uint64)
-            p_wy_j = jnp.array(wild_p0_y[mask_w], dtype=jnp.uint64)
-            q_wx_j = jnp.array(wild_q_x[mask_w], dtype=jnp.uint64)
-            q_wy_j = jnp.array(wild_q_y[mask_w], dtype=jnp.uint64)
-            rwx_j, rwy_j = engine["ecc_add"](p_wx_j, p_wy_j, q_wx_j, q_wy_j)
-            wild_x_np[mask_w] = np.array(rwx_j)
-            wild_y_np[mask_w] = np.array(rwy_j)
+            rwx_np, rwy_np = chunked_ecc_add(wild_p0_x[mask_w], wild_p0_y[mask_w], wild_q_x[mask_w], wild_q_y[mask_w])
+            wild_x_np[mask_w] = rwx_np
+            wild_y_np[mask_w] = rwy_np
     else:
         seed_dists_w = [(j + 1) * stride + (j * 7331) % stride for j in range(M)]
         seed_pts_w = [scalar_mult_g_np(start_int + d) for d in seed_dists_w]
@@ -738,13 +744,9 @@ def main():
         wild_y_np = wild_p0_y.copy()
 
         if np.any(mask_w):
-            p_wx_j = jnp.array(wild_p0_x[mask_w], dtype=jnp.uint64)
-            p_wy_j = jnp.array(wild_p0_y[mask_w], dtype=jnp.uint64)
-            q_wx_j = jnp.array(wild_q_x[mask_w], dtype=jnp.uint64)
-            q_wy_j = jnp.array(wild_q_y[mask_w], dtype=jnp.uint64)
-            rwx_j, rwy_j = engine["ecc_add"](p_wx_j, p_wy_j, q_wx_j, q_wy_j)
-            wild_x_np[mask_w] = np.array(rwx_j)
-            wild_y_np[mask_w] = np.array(rwy_j)
+            rwx_np, rwy_np = chunked_ecc_add(wild_p0_x[mask_w], wild_p0_y[mask_w], wild_q_x[mask_w], wild_q_y[mask_w])
+            wild_x_np[mask_w] = rwx_np
+            wild_y_np[mask_w] = rwy_np
 
 
 
