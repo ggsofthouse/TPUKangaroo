@@ -679,15 +679,17 @@ def main():
                 else:
                     dp_database[x_hex] = (k_type, d_val, idx)
 
-        # Print throughput every 1000 steps
-        if step % 1000 == 0:
+        # Dynamic print frequency to show live stats every 1-2 seconds on TPU/GPU
+        print_freq = max(1, 1000000 // N)
+        if step % print_freq == 0:
             t_elapsed = time.time() - t_start
             total_ops = N * step
             rate = total_ops / t_elapsed
-            print(f"⏱️ Passo {step:,} | Saltos Totais: {total_ops:,} | Velocidade: {rate/1e3:.2f} Kops/s | DPs: {dp_count:,}")
+            print(f"⏱️ Passo {step:,} | Saltos Totais: {total_ops:,} | Velocidade: {rate/1e3:.2f} Kops/s | DPs Capturados: {dp_count:,}")
 
         # If finite steps requested, exit after reaching limit
         if args.steps > 0 and step >= args.steps:
+
             break
 
 
