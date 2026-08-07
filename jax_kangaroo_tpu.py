@@ -17,6 +17,7 @@ import time
 import argparse
 import math
 import numpy as np
+import functools
 
 if sys.platform == "win32":
     try:
@@ -27,6 +28,7 @@ if sys.platform == "win32":
 
 # secp256k1 Constants
 P_INT = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+N_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 GX_INT = 0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
 GY_INT = 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8
 
@@ -375,7 +377,7 @@ def build_jax_math_engine(jax):
 
         return next_x, next_y, next_dist, is_dp
 
-    @jax.jit
+    @functools.partial(jax.jit, static_argnames=('steps_per_block',))
     def scan_jump_block(curr_x: jnp.ndarray, curr_y: jnp.ndarray, curr_dist: jnp.ndarray,
                         table_x: jnp.ndarray, table_y: jnp.ndarray, table_dists: jnp.ndarray,
                         dp_mask: jnp.uint64, steps_per_block: int):
@@ -785,7 +787,7 @@ def main():
                             tame_init_off = tame_offsets[tame_idx]
                             wild_init_off = wild_offsets[wild_idx]
 
-                            priv_key_int = (start_int + tame_init_off + tame_d - (wild_init_off + wild_d)) % P_INT
+                            priv_key_int = (start_int + tame_init_off + tame_d - (wild_init_off + wild_d)) % N_ORDER
                             priv_key_hex = f"{priv_key_int:064x}"
 
                             print(f"🔑 CHAVE PRIVADA ENCONTRADA: 0x{priv_key_hex}")
