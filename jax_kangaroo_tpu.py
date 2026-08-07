@@ -355,7 +355,7 @@ def build_jax_math_engine(jax):
         """Vectorized Affine Point Addition: (X3, Y3) = (X1, Y1) + (X2, Y2)."""
         dy = sub_256_raw(y2, y1)
         dx = sub_256_raw(x2, x1)
-        dx_inv = batch_inverse_mod_p(dx)
+        dx_inv = inv_mod_p(dx)
         lam = mul_256_mod_p(dy, dx_inv)
 
         lam2 = mul_256_mod_p(lam, lam)
@@ -374,7 +374,7 @@ def build_jax_math_engine(jax):
 
         two_limbs = jnp.array([2, 0, 0, 0, 0, 0, 0, 0], dtype=jnp.uint64)
         den = mul_256_mod_p(y1, jnp.broadcast_to(two_limbs, y1.shape))
-        den_inv = batch_inverse_mod_p(den)
+        den_inv = inv_mod_p(den)
         lam = mul_256_mod_p(num, den_inv)
 
         lam2 = mul_256_mod_p(lam, lam)
