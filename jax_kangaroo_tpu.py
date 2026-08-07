@@ -376,41 +376,22 @@ def build_jax_math_engine(jax):
         return next_x, next_y, next_dist, is_dp
 
     @jax.jit
-    def sub_loop_tpu(curr_x: jnp.ndarray, curr_y: jnp.ndarray, curr_dist: jnp.ndarray,
-                     table_x: jnp.ndarray, table_y: jnp.ndarray, table_dists: jnp.ndarray,
-                     dp_mask: jnp.uint64, steps_per_block: int):
+    def scan_jump_block(curr_x: jnp.ndarray, curr_y: jnp.ndarray, curr_dist: jnp.ndarray,
+                        table_x: jnp.ndarray, table_y: jnp.ndarray, table_dists: jnp.ndarray,
+                        dp_mask: jnp.uint64, steps_per_block: int):
         """
-        Executes 'steps_per_block' (e.g. 1,000 or 10,000) sequential jump steps fully confined
-        inside TPU HBM2e memory without Device-to-Host transfer latency per step.
+        Executes 'steps_per_block' (e.g. 1,000 or 5,000) sequential jump steps in compiled HBM2e memory
+        using jax.lax.scan, returning final states and stacked DP flag outputs.
         """
-        table_size = table_x.shape[0]
+        def scan_fn(carry, _):
+            cx, cy, cd = carry
+            nx, ny, nd, is_dp = kangaroo_jump_step(cx, cy, cd, table_x, table_y, table_dists, dp_mask)
+            return (nx, ny, nd), (is_dp, nx, ny, nd)
 
-        def body_fun(i, state):
-            cx, cy, cd, total_dps, dp_acc = state
-            
-            # 1. Table index extraction
-            jump_idx = (cx[..., 0] & jnp.uint64(table_size - 1)).astype(jnp.int32)
-            
-            # 2. Table lookup via jnp.take
-            j_x = jnp.take(table_x, jump_idx, axis=0)
-            j_y = jnp.take(table_y, jump_idx, axis=0)
-            j_d = jnp.take(table_dists, jump_idx, axis=0)
-            
-            # 3. 12-limb ECC point addition (ecc_add_affine)
-            nx, ny = ecc_add_affine(cx, cy, j_x, j_y)
-            nd = cd + j_d
-            
-            # 4. TPU DP check and accumulation
-            dp_flags = (nx[..., 0] & dp_mask) == jnp.uint64(0)
-            new_dps = jnp.sum(dp_flags.astype(jnp.int32))
-            
-            return nx, ny, nd, total_dps + new_dps, dp_acc | dp_flags
-
-        init_state = (curr_x, curr_y, curr_dist, jnp.int32(0), jnp.zeros((curr_x.shape[0],), dtype=jnp.bool_))
-        final_x, final_y, final_dist, block_dps, final_dp_mask = jax.lax.fori_loop(
-            0, steps_per_block, body_fun, init_state
+        (final_x, final_y, final_dist), (dp_stack, x_stack, y_stack, dist_stack) = jax.lax.scan(
+            scan_fn, (curr_x, curr_y, curr_dist), None, length=steps_per_block
         )
-        return final_x, final_y, final_dist, block_dps, final_dp_mask
+        return final_x, final_y, final_dist, dp_stack, x_stack, y_stack, dist_stack
 
     return {
         "add_256": add_256_raw,
@@ -420,7 +401,7 @@ def build_jax_math_engine(jax):
         "ecc_add": ecc_add_affine,
         "ecc_double": ecc_double_affine,
         "jump_step": kangaroo_jump_step,
-        "sub_loop_tpu": sub_loop_tpu,
+        "scan_jump_block": scan_jump_block,
     }
 
 
@@ -721,15 +702,17 @@ def main():
         print(f"🎯 Distinguished Points (DP) ativado: Lowest {dp_bits} bits masked (0x{(1 << dp_bits) - 1:X}, ~{expected_dps:,} DPs por passo)")
 
     dp_mask = jnp.uint64((1 << dp_bits) - 1)
-
+    steps_per_block = args.inner_steps if args.inner_steps > 0 else 1000
     MB = min(N, 1048576)
-    print(f"⚡ JIT Compiling Vectorized Kangaroo Jump Step (Micro-Batch Size: {MB:,})...")
+    print(f"⚡ JIT Compiling Unrolled Scan Kangaroo Jump Kernel ({steps_per_block:,} TPU inner steps/block)...")
     t_jit_jump = time.time()
-    test_nx, test_ny, test_nd, test_dp = engine["jump_step"](batch_kx[:MB], batch_ky[:MB], batch_dist[:MB], tx_jax, ty_jax, td_jax, dp_mask)
-    test_nx.block_until_ready()
-    print(f"✅ Jump Step JIT Compilation completed in {time.time() - t_jit_jump:.4f}s")
+    test_fx, test_fy, test_fd, test_dp, test_xs, test_ys, test_ds = engine["scan_jump_block"](
+        batch_kx[:MB], batch_ky[:MB], batch_dist[:MB], tx_jax, ty_jax, td_jax, dp_mask, steps_per_block
+    )
+    test_fx.block_until_ready()
+    print(f"✅ Unrolled Scan TPU Jump Kernel JIT Compilation completed in {time.time() - t_jit_jump:.4f}s")
 
-    print(f"🔥 Executing parallel jump steps across {N:,} kangaroos in chunks of {MB:,}...")
+    print(f"🔥 Executing unrolled scan jump blocks across {N:,} kangaroos ({steps_per_block:,} saltos/bloco)...")
 
     types_np = np.array(['TAME'] * half_n + ['WILD'] * (N - half_n))
 
@@ -739,42 +722,47 @@ def main():
 
     t_start = time.time()
     curr_x, curr_y, curr_dist = batch_kx, batch_ky, batch_dist
-    step = 0
+    block = 0
 
     while True:
-        step += 1
+        block += 1
         
-        # Step through micro-batches
+        # Step through micro-batches using unrolled hardware scan block
         next_x_chunks, next_y_chunks, next_dist_chunks = [], [], []
         for start_idx in range(0, N, MB):
             end_idx = min(start_idx + MB, N)
-            nx, ny, nd, is_dp = engine["jump_step"](
+            fx, fy, fd, dp_stack, x_stack, y_stack, dist_stack = engine["scan_jump_block"](
                 curr_x[start_idx:end_idx],
                 curr_y[start_idx:end_idx],
                 curr_dist[start_idx:end_idx],
                 tx_jax, ty_jax, td_jax,
-                dp_mask
+                dp_mask,
+                steps_per_block
             )
-            next_x_chunks.append(nx)
-            next_y_chunks.append(ny)
-            next_dist_chunks.append(nd)
+            next_x_chunks.append(fx)
+            next_y_chunks.append(fy)
+            next_dist_chunks.append(fd)
 
-            # Force TPU-to-Host CPU sync using block_until_ready() for reliable DP mask evaluation
-            dp_flags = np.array(is_dp.block_until_ready())
-            dp_indices = np.where(dp_flags)[0]
+            # Evaluate any DP hits recorded during the steps_per_block iterations
+            dp_flags_np = np.array(dp_stack.block_until_ready())
+            step_indices, chunk_indices = np.where(dp_flags_np)
 
-            if len(dp_indices) > 0:
-                for chunk_idx in dp_indices:
-                    global_idx = start_idx + chunk_idx
-                    x_hex = hex(limbs_to_int_np(nx[chunk_idx]))
-                    y_hex = hex(limbs_to_int_np(ny[chunk_idx]))
-                    d_val = int(nd[chunk_idx])
+            if len(step_indices) > 0:
+                x_stack_np = np.array(x_stack)
+                dist_stack_np = np.array(dist_stack)
+
+                for idx_i in range(len(step_indices)):
+                    s_idx = step_indices[idx_i]
+                    c_idx = chunk_indices[idx_i]
+                    global_idx = start_idx + c_idx
+                    x_hex = hex(limbs_to_int_np(x_stack_np[s_idx, c_idx]))
+                    d_val = int(dist_stack_np[s_idx, c_idx])
                     k_type = types_np[global_idx]
                     dp_count += 1
 
                     # Log DP to log file
                     with open(dp_log_filename, "a") as f:
-                        f.write(f"STEP:{step} | ID:{global_idx} | TYPE:{k_type} | DIST:{d_val} | X:{x_hex}\n")
+                        f.write(f"BLOCK:{block} | STEP:{s_idx} | ID:{global_idx} | TYPE:{k_type} | DIST:{d_val} | X:{x_hex}\n")
 
                     # Check Collision
                     if x_hex in dp_database:
@@ -797,7 +785,6 @@ def main():
                             tame_init_off = tame_offsets[tame_idx]
                             wild_init_off = wild_offsets[wild_idx]
 
-                            # Private Key = start_int + tame_init_off + tame_d - (wild_init_off + wild_d)
                             priv_key_int = (start_int + tame_init_off + tame_d - (wild_init_off + wild_d)) % P_INT
                             priv_key_hex = f"{priv_key_int:064x}"
 
@@ -814,26 +801,21 @@ def main():
         curr_y = jnp.vstack(next_y_chunks)
         curr_dist = jnp.concatenate(next_dist_chunks)
 
-        # Dynamic print frequency to show live stats
-        print_freq = max(1, 1000000 // N)
-        if step % print_freq == 0:
-            t_elapsed = time.time() - t_start
-            total_ops = N * step
-            rate = total_ops / t_elapsed
-            print(f"⏱️ Passo {step:,} | Saltos Totais: {total_ops:,} | Velocidade: {rate/1e3:.2f} Kops/s | DPs Capturados: {dp_count:,}")
+        t_elapsed = time.time() - t_start
+        total_ops = N * block * steps_per_block
+        rate = total_ops / t_elapsed
+        print(f"⏱️ Bloco {block:,} ({block * steps_per_block:,} saltos/canguru) | Saltos Totais: {total_ops:,} | Velocidade: {rate/1e6:.4f} Mops/s ({rate/1e3:.2f} Kops/s) | DPs: {dp_count:,}")
 
-        # If finite steps requested, exit after reaching limit
-        if args.steps > 0 and step >= args.steps:
+        if args.steps > 0 and (block * steps_per_block) >= args.steps:
             break
-
 
     curr_x.block_until_ready()
     t_end = time.time() - t_start
     
-    total_ops = N * step
+    total_ops = N * block * steps_per_block
     rate = total_ops / t_end
     print("================================================================================")
-    print(f"⏱️ Finalizado {step:,} passos em {t_end:.4f} segundos")
+    print(f"⏱️ Finalizado {block:,} blocos ({block * steps_per_block:,} saltos/canguru) em {t_end:.4f} segundos")
     print(f"⚡ Throughput Rate: {rate / 1e3:.2f} Kops/sec ({rate / 1e6:.4f} Mops/sec)")
     print(f"📌 Total de Pontos Distintos (DPs) capturados: {dp_count} (DB size: {len(dp_database)})")
     print("================================================================================")
