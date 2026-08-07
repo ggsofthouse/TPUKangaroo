@@ -590,8 +590,10 @@ def main():
 
     t_start = time.time()
     curr_x, curr_y, curr_dist = batch_kx, batch_ky, batch_dist
+    step = 0
 
-    for step in range(1, args.steps + 1):
+    while True:
+        step += 1
         curr_x, curr_y, curr_dist = engine["jump_step"](curr_x, curr_y, curr_dist, tx_jax, ty_jax, td_jax)
         
         # Check DP condition across batch: (curr_x[..., 0] & dp_mask) == 0
@@ -641,18 +643,29 @@ def main():
                 else:
                     dp_database[x_hex] = (k_type, d_val, idx)
 
+        # Print throughput every 1000 steps
+        if step % 1000 == 0:
+            t_elapsed = time.time() - t_start
+            total_ops = N * step
+            rate = total_ops / t_elapsed
+            print(f"⏱️ Passo {step:,} | Saltos Totais: {total_ops:,} | Velocidade: {rate/1e3:.2f} Kops/s | DPs: {dp_count:,}")
+
+        # If finite steps requested, exit after reaching limit
+        if args.steps > 0 and step >= args.steps:
+            break
+
     curr_x.block_until_ready()
     t_end = time.time() - t_start
     
-    total_ops = N * args.steps
+    total_ops = N * step
     rate = total_ops / t_end
     print("================================================================================")
-    print(f"⏱️ Execution Time for {args.steps} steps: {t_end:.4f} seconds")
+    print(f"⏱️ Finalizado {step:,} passos em {t_end:.4f} segundos")
     print(f"⚡ Throughput Rate: {rate / 1e3:.2f} Kops/sec ({rate / 1e6:.4f} Mops/sec)")
     print(f"📌 Total de Pontos Distintos (DPs) capturados: {dp_count} (DB size: {len(dp_database)})")
     print("================================================================================")
-    print("🎯 Exército de Cangurus com Detecção de DP e Solucionador de Colisão 100% Ativo!")
 
 
 if __name__ == "__main__":
     main()
+
