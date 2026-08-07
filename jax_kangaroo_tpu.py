@@ -382,18 +382,18 @@ def build_jax_math_engine(jax):
                         table_x: jnp.ndarray, table_y: jnp.ndarray, table_dists: jnp.ndarray,
                         dp_mask: jnp.uint64, steps_per_block: int):
         """
-        Executes 'steps_per_block' (e.g. 1,000 or 5,000) sequential jump steps in compiled HBM2e memory
-        using jax.lax.scan, returning final states and stacked DP flag outputs.
+        Executes 'steps_per_block' (e.g. 100) sequential jump steps in compiled HBM2e memory
+        using jax.lax.scan, returning final states and lightweight DP flag outputs.
         """
         def scan_fn(carry, _):
             cx, cy, cd = carry
             nx, ny, nd, is_dp = kangaroo_jump_step(cx, cy, cd, table_x, table_y, table_dists, dp_mask)
-            return (nx, ny, nd), (is_dp, nx, ny, nd)
+            return (nx, ny, nd), is_dp
 
-        (final_x, final_y, final_dist), (dp_stack, x_stack, y_stack, dist_stack) = jax.lax.scan(
+        (final_x, final_y, final_dist), dp_stack = jax.lax.scan(
             scan_fn, (curr_x, curr_y, curr_dist), None, length=steps_per_block
         )
-        return final_x, final_y, final_dist, dp_stack, x_stack, y_stack, dist_stack
+        return final_x, final_y, final_dist, dp_stack
 
     return {
         "add_256": add_256_raw,
@@ -481,7 +481,7 @@ def main():
     parser.add_argument('--dp-bits', type=int, default=None, help="Distinguished point bits (auto-recommended targeting 500-1000 DPs/step if not specified)")
     parser.add_argument('--steps', type=int, default=0, help="Steps to run (0 for infinite loop)")
     parser.add_argument('--jump-table-size', type=int, default=64, choices=[32, 64, 128], help="Jump table size (32, 64 or 128)")
-    parser.add_argument('--inner-steps', type=int, default=1000, help="TPU hardware inner unrolled steps per cycle (e.g. 1000)")
+    parser.add_argument('--inner-steps', type=int, default=100, help="TPU hardware inner unrolled steps per cycle (default: 100)")
     args = parser.parse_args()
 
     print("================================================================================")
@@ -704,11 +704,11 @@ def main():
         print(f"🎯 Distinguished Points (DP) ativado: Lowest {dp_bits} bits masked (0x{(1 << dp_bits) - 1:X}, ~{expected_dps:,} DPs por passo)")
 
     dp_mask = jnp.uint64((1 << dp_bits) - 1)
-    steps_per_block = args.inner_steps if args.inner_steps > 0 else 1000
+    steps_per_block = args.inner_steps if args.inner_steps > 0 else 100
     MB = min(N, 1048576)
     print(f"⚡ JIT Compiling Unrolled Scan Kangaroo Jump Kernel ({steps_per_block:,} TPU inner steps/block)...")
     t_jit_jump = time.time()
-    test_fx, test_fy, test_fd, test_dp, test_xs, test_ys, test_ds = engine["scan_jump_block"](
+    test_fx, test_fy, test_fd, test_dp = engine["scan_jump_block"](
         batch_kx[:MB], batch_ky[:MB], batch_dist[:MB], tx_jax, ty_jax, td_jax, dp_mask, steps_per_block
     )
     test_fx.block_until_ready()
@@ -733,7 +733,7 @@ def main():
         next_x_chunks, next_y_chunks, next_dist_chunks = [], [], []
         for start_idx in range(0, N, MB):
             end_idx = min(start_idx + MB, N)
-            fx, fy, fd, dp_stack, x_stack, y_stack, dist_stack = engine["scan_jump_block"](
+            fx, fy, fd, dp_stack = engine["scan_jump_block"](
                 curr_x[start_idx:end_idx],
                 curr_y[start_idx:end_idx],
                 curr_dist[start_idx:end_idx],
@@ -750,21 +750,20 @@ def main():
             step_indices, chunk_indices = np.where(dp_flags_np)
 
             if len(step_indices) > 0:
-                x_stack_np = np.array(x_stack)
-                dist_stack_np = np.array(dist_stack)
+                fx_np = np.array(fx)
+                fd_np = np.array(fd)
+                unique_c_indices = np.unique(chunk_indices)
 
-                for idx_i in range(len(step_indices)):
-                    s_idx = step_indices[idx_i]
-                    c_idx = chunk_indices[idx_i]
+                for c_idx in unique_c_indices:
                     global_idx = start_idx + c_idx
-                    x_hex = hex(limbs_to_int_np(x_stack_np[s_idx, c_idx]))
-                    d_val = int(dist_stack_np[s_idx, c_idx])
+                    x_hex = hex(limbs_to_int_np(fx_np[c_idx]))
+                    d_val = int(fd_np[c_idx])
                     k_type = types_np[global_idx]
                     dp_count += 1
 
                     # Log DP to log file
                     with open(dp_log_filename, "a") as f:
-                        f.write(f"BLOCK:{block} | STEP:{s_idx} | ID:{global_idx} | TYPE:{k_type} | DIST:{d_val} | X:{x_hex}\n")
+                        f.write(f"BLOCK:{block} | ID:{global_idx} | TYPE:{k_type} | DIST:{d_val} | X:{x_hex}\n")
 
                     # Check Collision
                     if x_hex in dp_database:
