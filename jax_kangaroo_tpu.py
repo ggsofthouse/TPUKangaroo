@@ -457,7 +457,7 @@ def main():
     parser.add_argument('--pubkey', type=str, default=None, help="Target public key in hex (compressed 02/03... or uncompressed 04...)")
     parser.add_argument('--start', type=str, default="80000000000000000000", help="Start offset hex of the range")
     parser.add_argument('--kangaroos', type=int, default=1024, help="Number of parallel kangaroos per tensor batch")
-    parser.add_argument('--dp-bits', type=int, default=16, help="Distinguished point bits")
+    parser.add_argument('--dp-bits', type=int, default=None, help="Distinguished point bits (auto-recommended targeting 500-1000 DPs/step if not specified)")
     parser.add_argument('--steps', type=int, default=0, help="Steps to run (0 for infinite loop)")
     parser.add_argument('--jump-table-size', type=int, default=64, choices=[32, 64, 128], help="Jump table size (32, 64 or 128)")
     args = parser.parse_args()
@@ -670,9 +670,18 @@ def main():
     batch_dist = jnp.zeros((N,), dtype=jnp.uint64)
 
 
-    dp_bits = args.dp_bits
+    if args.dp_bits is None or args.dp_bits <= 0:
+        # Target 500-1000 DPs per step: dp_bits = log2(N) - 9
+        rec_bits = max(4, min(32, int(math.log2(N)) - 9))
+        dp_bits = rec_bits
+        expected_dps = max(1, N // (1 << dp_bits))
+        print(f"💡 recomendação automática ativada: --dp-bits={dp_bits} (Densidade Alvo: ~{expected_dps:,} DPs por passo)")
+    else:
+        dp_bits = args.dp_bits
+        expected_dps = max(1, N // (1 << dp_bits))
+        print(f"🎯 Distinguished Points (DP) ativado: Lowest {dp_bits} bits masked (0x{(1 << dp_bits) - 1:X}, ~{expected_dps:,} DPs por passo)")
+
     dp_mask = jnp.uint64((1 << dp_bits) - 1)
-    print(f"🎯 Distinguished Points (DP) active: Lowest {dp_bits} bits masked (0x{dp_mask:X})")
 
     # Micro-batch size optimized for TPU HBM and minimum host RPC overhead
     MB = min(N, 1048576)
