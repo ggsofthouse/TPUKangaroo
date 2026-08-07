@@ -525,32 +525,26 @@ def main():
     range_span = (1 << args.range) if args.range < 256 else (1 << 80)
     stride = max(1, range_span // half_n)
 
-    # Fast seed table generation in Python (M = min(half_n, 256) seed points)
-    M = min(half_n, 256)
-    seed_dists_t = [i * stride + (i * 1337) % stride for i in range(M)]
-    seed_t_x, seed_t_y = [], []
-    for d in seed_dists_t:
+    # Generate unique initial offsets for all kangaroos across range_span
+    tame_offsets = [int(i * stride + ((i * 1337) % stride)) for i in range(half_n)]
+    
+    tame_x_list, tame_y_list = [], []
+    for d in tame_offsets:
         kx, ky = scalar_mult_g_np(start_int + d)
-        seed_t_x.append(int_to_limbs_np(kx))
-        seed_t_y.append(int_to_limbs_np(ky))
-
-    seed_t_x = np.array(seed_t_x, dtype=np.uint64)
-    seed_t_y = np.array(seed_t_y, dtype=np.uint64)
-
-    reps = half_n // M
-    rem = half_n % M
-    tame_x_np = np.vstack([np.tile(seed_t_x, (reps, 1)), seed_t_x[:rem]]) if rem > 0 else np.tile(seed_t_x, (reps, 1))
-    tame_y_np = np.vstack([np.tile(seed_t_y, (reps, 1)), seed_t_y[:rem]]) if rem > 0 else np.tile(seed_t_y, (reps, 1))
-    tame_offsets = seed_dists_t * reps + seed_dists_t[:rem]
+        tame_x_list.append(int_to_limbs_np(kx))
+        tame_y_list.append(int_to_limbs_np(ky))
+    
+    tame_x_np = np.array(tame_x_list, dtype=np.uint64)
+    tame_y_np = np.array(tame_y_list, dtype=np.uint64)
 
     if args.pubkey:
         pk_x, pk_y = parse_pubkey_hex(args.pubkey)
-        seed_dists_w = [j * stride + (j * 7331) % stride for j in range(M)]
-        seed_w_x, seed_w_y = [], []
-        for d in seed_dists_w:
+        wild_offsets = [int(j * stride + ((j * 7331) % stride)) for j in range(half_n)]
+        wild_x_list, wild_y_list = [], []
+        for d in wild_offsets:
             if d == 0:
-                seed_w_x.append(int_to_limbs_np(pk_x))
-                seed_w_y.append(int_to_limbs_np(pk_y))
+                wild_x_list.append(int_to_limbs_np(pk_x))
+                wild_y_list.append(int_to_limbs_np(pk_y))
             else:
                 ox, oy = scalar_mult_g_np(d)
                 num = (oy - pk_y) % P_INT
@@ -558,26 +552,21 @@ def main():
                 lam = (num * pow(den, P_INT - 2, P_INT)) % P_INT
                 wx = (lam**2 - pk_x - ox) % P_INT
                 wy = (lam * (pk_x - wx) - pk_y) % P_INT
-                seed_w_x.append(int_to_limbs_np(wx))
-                seed_w_y.append(int_to_limbs_np(wy))
+                wild_x_list.append(int_to_limbs_np(wx))
+                wild_y_list.append(int_to_limbs_np(wy))
 
-        seed_w_x = np.array(seed_w_x, dtype=np.uint64)
-        seed_w_y = np.array(seed_w_y, dtype=np.uint64)
-        wild_x_np = np.vstack([np.tile(seed_w_x, (reps, 1)), seed_w_x[:rem]]) if rem > 0 else np.tile(seed_w_x, (reps, 1))
-        wild_y_np = np.vstack([np.tile(seed_w_y, (reps, 1)), seed_w_y[:rem]]) if rem > 0 else np.tile(seed_w_y, (reps, 1))
-        wild_offsets = seed_dists_w * reps + seed_dists_w[:rem]
+        wild_x_np = np.array(wild_x_list, dtype=np.uint64)
+        wild_y_np = np.array(wild_y_list, dtype=np.uint64)
     else:
-        seed_dists_w = [(j + 1) * stride + (j * 7331) % stride for j in range(M)]
-        seed_w_x, seed_w_y = [], []
-        for d in seed_dists_w:
+        wild_offsets = [int((j + 1) * stride + ((j * 7331) % stride)) for j in range(half_n)]
+        wild_x_list, wild_y_list = [], []
+        for d in wild_offsets:
             kx, ky = scalar_mult_g_np(start_int + d)
-            seed_w_x.append(int_to_limbs_np(kx))
-            seed_w_y.append(int_to_limbs_np(ky))
-        seed_w_x = np.array(seed_w_x, dtype=np.uint64)
-        seed_w_y = np.array(seed_w_y, dtype=np.uint64)
-        wild_x_np = np.vstack([np.tile(seed_w_x, (reps, 1)), seed_w_x[:rem]]) if rem > 0 else np.tile(seed_w_x, (reps, 1))
-        wild_y_np = np.vstack([np.tile(seed_w_y, (reps, 1)), seed_w_y[:rem]]) if rem > 0 else np.tile(seed_w_y, (reps, 1))
-        wild_offsets = seed_dists_w * reps + seed_dists_w[:rem]
+            wild_x_list.append(int_to_limbs_np(kx))
+            wild_y_list.append(int_to_limbs_np(ky))
+        wild_x_np = np.array(wild_x_list, dtype=np.uint64)
+        wild_y_np = np.array(wild_y_list, dtype=np.uint64)
+
 
     batch_kx_np = np.vstack([tame_x_np, wild_x_np])
     batch_ky_np = np.vstack([tame_y_np, wild_y_np])
