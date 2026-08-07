@@ -378,22 +378,29 @@ def build_jax_math_engine(jax):
         return next_x, next_y, next_dist, is_dp
 
     @functools.partial(jax.jit, static_argnames=('steps_per_block',))
-    def scan_jump_block(curr_x: jnp.ndarray, curr_y: jnp.ndarray, curr_dist: jnp.ndarray,
-                        table_x: jnp.ndarray, table_y: jnp.ndarray, table_dists: jnp.ndarray,
-                        dp_mask: jnp.uint64, steps_per_block: int):
+    def tpu_conconfined_loop(init_x: jnp.ndarray, init_y: jnp.ndarray, init_dist: jnp.ndarray,
+                             table_x: jnp.ndarray, table_y: jnp.ndarray, table_dists: jnp.ndarray,
+                             dp_mask: jnp.uint64, steps_per_block: int):
         """
-        Executes 'steps_per_block' (e.g. 100) sequential jump steps in compiled HBM2e memory
-        using jax.lax.scan, returning final states and lightweight DP flag outputs.
+        Executes thousands of sequential ECC jumps DIRECTLY on TPU hardware,
+        without any data transfer or bus interruption per step.
         """
-        def scan_fn(carry, _):
-            cx, cy, cd = carry
-            nx, ny, nd, is_dp = kangaroo_jump_step(cx, cy, cd, table_x, table_y, table_dists, dp_mask)
-            return (nx, ny, nd), is_dp
+        table_size = table_x.shape[0]
 
-        (final_x, final_y, final_dist), dp_stack = jax.lax.scan(
-            scan_fn, (curr_x, curr_y, curr_dist), None, length=steps_per_block
-        )
-        return final_x, final_y, final_dist, dp_stack
+        def body_fun(i, state):
+            cx, cy, cd = state
+            jump_idx = (cx[..., 0] & jnp.uint64(table_size - 1)).astype(jnp.int32)
+            j_x = jnp.take(table_x, jump_idx, axis=0)
+            j_y = jnp.take(table_y, jump_idx, axis=0)
+            j_d = jnp.take(table_dists, jump_idx, axis=0)
+            nx, ny = ecc_add_affine(cx, cy, j_x, j_y)
+            nd = cd + j_d
+            return nx, ny, nd
+
+        init_state = (init_x, init_y, init_dist)
+        final_x, final_y, final_dist = jax.lax.fori_loop(0, steps_per_block, body_fun, init_state)
+        final_dp_flags = (final_x[..., 0] & dp_mask) == jnp.uint64(0)
+        return final_x, final_y, final_dist, final_dp_flags
 
     return {
         "add_256": add_256_raw,
@@ -403,7 +410,7 @@ def build_jax_math_engine(jax):
         "ecc_add": ecc_add_affine,
         "ecc_double": ecc_double_affine,
         "jump_step": kangaroo_jump_step,
-        "scan_jump_block": scan_jump_block,
+        "tpu_conconfined_loop": tpu_conconfined_loop,
     }
 
 
@@ -481,7 +488,7 @@ def main():
     parser.add_argument('--dp-bits', type=int, default=None, help="Distinguished point bits (auto-recommended targeting 500-1000 DPs/step if not specified)")
     parser.add_argument('--steps', type=int, default=0, help="Steps to run (0 for infinite loop)")
     parser.add_argument('--jump-table-size', type=int, default=64, choices=[32, 64, 128], help="Jump table size (32, 64 or 128)")
-    parser.add_argument('--inner-steps', type=int, default=10, help="TPU hardware inner unrolled steps per cycle (default: 10)")
+    parser.add_argument('--inner-steps', type=int, default=5000, help="TPU hardware inner unrolled steps per cycle (default: 5000)")
     args = parser.parse_args()
 
     print("================================================================================")
@@ -704,64 +711,64 @@ def main():
         print(f"🎯 Distinguished Points (DP) ativado: Lowest {dp_bits} bits masked (0x{(1 << dp_bits) - 1:X}, ~{expected_dps:,} DPs por passo)")
 
     dp_mask = jnp.uint64((1 << dp_bits) - 1)
-    steps_per_block = args.inner_steps if args.inner_steps > 0 else 10
+    steps_per_block = args.inner_steps if args.inner_steps > 0 else 5000
     MB = min(N, 1048576)
-    print(f"⚡ JIT Compiling Vectorized Kangaroo Jump Step (Micro-Batch Size: {MB:,})...")
+    print(f"🔥 MÁXIMA FORÇA ATIVADA: JIT Compilando blocos de {steps_per_block:,} saltos confinados...")
     t_jit_jump = time.time()
-    test_nx, test_ny, test_nd, test_dp = engine["jump_step"](
-        batch_kx[:MB], batch_ky[:MB], batch_dist[:MB], tx_jax, ty_jax, td_jax, dp_mask
+    test_fx, test_fy, test_fd, test_dp = engine["tpu_conconfined_loop"](
+        batch_kx[:MB], batch_ky[:MB], batch_dist[:MB], tx_jax, ty_jax, td_jax, dp_mask, steps_per_block=steps_per_block
     )
-    test_nx.block_until_ready()
-    print(f"✅ Jump Step JIT Compilation completed in {time.time() - t_jit_jump:.4f}s")
+    test_fx.block_until_ready()
+    print(f"✅ Kernel TPU Confinado JIT Compilado em {time.time() - t_jit_jump:.4f}s")
 
-    print(f"🔥 Executing parallel jump steps across {N:,} kangaroos in chunks of {MB:,}...")
+    print(f"🔥 Executando marcha contínua na matriz sistólica across {N:,} kangaroos ({steps_per_block:,} saltos/bloco)...")
 
     types_np = np.array(['TAME'] * half_n + ['WILD'] * (N - half_n))
 
     dp_database = {}
     dp_log_filename = "dp_database.log"
-    dp_count = 0
+    total_dps = 0
 
     t_start = time.time()
     curr_x, curr_y, curr_dist = batch_kx, batch_ky, batch_dist
-    step = 0
+    bloco = 0
 
     while True:
-        step += 1
+        bloco += 1
         
-        # Step through micro-batches
         next_x_chunks, next_y_chunks, next_dist_chunks = [], [], []
+        dps_no_bloco = 0
         for start_idx in range(0, N, MB):
             end_idx = min(start_idx + MB, N)
-            nx, ny, nd, is_dp = engine["jump_step"](
+            fx, fy, fd, dp_flags = engine["tpu_conconfined_loop"](
                 curr_x[start_idx:end_idx],
                 curr_y[start_idx:end_idx],
                 curr_dist[start_idx:end_idx],
                 tx_jax, ty_jax, td_jax,
-                dp_mask
+                dp_mask,
+                steps_per_block=steps_per_block
             )
-            next_x_chunks.append(nx)
-            next_y_chunks.append(ny)
-            next_dist_chunks.append(nd)
+            next_x_chunks.append(fx)
+            next_y_chunks.append(fy)
+            next_dist_chunks.append(fd)
 
-            dp_flags = np.array(is_dp.block_until_ready())
-            dp_indices = np.where(dp_flags)[0]
+            dp_flags_cpu = np.array(dp_flags.block_until_ready())
+            indices_dp = np.where(dp_flags_cpu)[0]
+            dps_no_bloco += len(indices_dp)
+            total_dps += len(indices_dp)
 
-            if len(dp_indices) > 0:
-                nx_np = np.array(nx)
-                nd_np = np.array(nd)
-                for chunk_idx in dp_indices:
+            if len(indices_dp) > 0:
+                fx_np = np.array(fx)
+                fd_np = np.array(fd)
+                for chunk_idx in indices_dp:
                     global_idx = start_idx + chunk_idx
-                    x_hex = hex(limbs_to_int_np(nx_np[chunk_idx]))
-                    d_val = int(nd_np[chunk_idx])
+                    x_hex = hex(limbs_to_int_np(fx_np[chunk_idx]))
+                    d_val = int(fd_np[chunk_idx])
                     k_type = types_np[global_idx]
-                    dp_count += 1
 
-                    # Log DP to log file
                     with open(dp_log_filename, "a") as f:
-                        f.write(f"STEP:{step} | ID:{global_idx} | TYPE:{k_type} | DIST:{d_val} | X:{x_hex}\n")
+                        f.write(f"BLOCK:{bloco} | ID:{global_idx} | TYPE:{k_type} | DIST:{d_val} | X:{x_hex}\n")
 
-                    # Check Collision
                     if x_hex in dp_database:
                         prev_type, prev_dist, prev_id = dp_database[x_hex]
                         if prev_type != k_type:
@@ -799,11 +806,11 @@ def main():
         curr_dist = jnp.concatenate(next_dist_chunks)
 
         t_elapsed = time.time() - t_start
-        total_ops = N * step
+        total_ops = N * bloco * steps_per_block
         rate = total_ops / t_elapsed
-        print(f"⏱️ Passo {step:,} | Saltos Totais: {total_ops:,} | Velocidade: {rate/1e6:.4f} Mops/s ({rate/1e3:.2f} Kops/s) | DPs Capturados: {dp_count:,}")
+        print(f"⏱️ Bloco {bloco:,} | Saltos Totais: {total_ops:,} | DPs: {total_dps:,} | Velocidade: {rate/1e6:.2f} Mops/s ({rate/1e3:.2f} Kops/s) | Turbina Livre!")
 
-        if args.steps > 0 and step >= args.steps:
+        if args.steps > 0 and (bloco * steps_per_block) >= args.steps:
             break
 
     curr_x.block_until_ready()
