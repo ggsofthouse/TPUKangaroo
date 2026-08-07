@@ -375,6 +375,23 @@ def build_jax_math_engine(jax):
 
         return next_x, next_y, next_dist, is_dp
 
+    @jax.jit
+    def multi_jump_step(curr_x: jnp.ndarray, curr_y: jnp.ndarray, curr_dist: jnp.ndarray,
+                        table_x: jnp.ndarray, table_y: jnp.ndarray, table_dists: jnp.ndarray,
+                        dp_mask: jnp.uint64, inner_steps: int):
+        """
+        Executes 'inner_steps' (e.g. 1,000) sequential jump steps fully compiled inside TPU HBM2e memory.
+        Returns final positions, distances, and accumulated DP boolean mask.
+        """
+        def body_fn(i, val):
+            cx, cy, cd, dp_acc = val
+            nx, ny, nd, is_dp = kangaroo_jump_step(cx, cy, cd, table_x, table_y, table_dists, dp_mask)
+            return nx, ny, nd, dp_acc | is_dp
+
+        init_val = (curr_x, curr_y, curr_dist, jnp.zeros((curr_x.shape[0],), dtype=jnp.bool_))
+        final_x, final_y, final_dist, final_dp = jax.lax.fori_loop(0, inner_steps, body_fn, init_val)
+        return final_x, final_y, final_dist, final_dp
+
     return {
         "add_256": add_256_raw,
         "sub_256": sub_256_raw,
@@ -383,6 +400,7 @@ def build_jax_math_engine(jax):
         "ecc_add": ecc_add_affine,
         "ecc_double": ecc_double_affine,
         "jump_step": kangaroo_jump_step,
+        "multi_jump_step": multi_jump_step,
     }
 
 
@@ -460,6 +478,7 @@ def main():
     parser.add_argument('--dp-bits', type=int, default=None, help="Distinguished point bits (auto-recommended targeting 500-1000 DPs/step if not specified)")
     parser.add_argument('--steps', type=int, default=0, help="Steps to run (0 for infinite loop)")
     parser.add_argument('--jump-table-size', type=int, default=64, choices=[32, 64, 128], help="Jump table size (32, 64 or 128)")
+    parser.add_argument('--inner-steps', type=int, default=1000, help="TPU hardware inner unrolled steps per cycle (e.g. 1000)")
     args = parser.parse_args()
 
     print("================================================================================")
@@ -683,17 +702,16 @@ def main():
 
     dp_mask = jnp.uint64((1 << dp_bits) - 1)
 
-    # Micro-batch size optimized for TPU HBM and minimum host RPC overhead
+    inner_k = args.inner_steps if args.inner_steps > 0 else 1000
     MB = min(N, 1048576)
-    print(f"⚡ JIT Compiling Vectorized Kangaroo Jump Step (Micro-Batch Size: {MB:,})...")
+    print(f"⚡ JIT Compiling Unrolled Vectorized Kangaroo Jump Kernel ({inner_k:,} inner TPU steps per cycle)...")
     t_jit_jump = time.time()
-    test_nx, test_ny, test_nd, test_dp = engine["jump_step"](batch_kx[:MB], batch_ky[:MB], batch_dist[:MB], tx_jax, ty_jax, td_jax, dp_mask)
+    test_nx, test_ny, test_nd, test_dp = engine["multi_jump_step"](batch_kx[:MB], batch_ky[:MB], batch_dist[:MB], tx_jax, ty_jax, td_jax, dp_mask, inner_k)
     test_nx.block_until_ready()
-    print(f"✅ Jump Step JIT Compilation completed in {time.time() - t_jit_jump:.4f}s")
+    print(f"✅ Unrolled TPU Jump Kernel JIT Compilation completed in {time.time() - t_jit_jump:.4f}s")
 
-    print(f"🔥 Executing parallel jump steps across {N:,} kangaroos in chunks of {MB:,}...")
+    print(f"🔥 Executing hardware-unrolled parallel jump steps across {N:,} kangaroos ({inner_k:,} saltos/ciclo)...")
 
-    
     types_np = np.array(['TAME'] * half_n + ['WILD'] * (N - half_n))
 
     dp_database = {}
@@ -707,16 +725,17 @@ def main():
     while True:
         step += 1
         
-        # Step through micro-batches
+        # Step through micro-batches with inner hardware unrolling
         next_x_chunks, next_y_chunks, next_dist_chunks = [], [], []
         for start_idx in range(0, N, MB):
             end_idx = min(start_idx + MB, N)
-            nx, ny, nd, is_dp = engine["jump_step"](
+            nx, ny, nd, is_dp = engine["multi_jump_step"](
                 curr_x[start_idx:end_idx],
                 curr_y[start_idx:end_idx],
                 curr_dist[start_idx:end_idx],
                 tx_jax, ty_jax, td_jax,
-                dp_mask
+                dp_mask,
+                inner_k
             )
             next_x_chunks.append(nx)
             next_y_chunks.append(ny)
@@ -725,7 +744,6 @@ def main():
             # Force TPU-to-Host CPU sync using block_until_ready() for reliable DP mask evaluation
             dp_flags = np.array(is_dp.block_until_ready())
             dp_indices = np.where(dp_flags)[0]
-
 
             if len(dp_indices) > 0:
                 for chunk_idx in dp_indices:
@@ -778,18 +796,14 @@ def main():
         curr_y = jnp.vstack(next_y_chunks)
         curr_dist = jnp.concatenate(next_dist_chunks)
 
-
-        # Dynamic print frequency to show live stats every 1-2 seconds on TPU/GPU
-        print_freq = max(1, 1000000 // N)
-        if step % print_freq == 0:
-            t_elapsed = time.time() - t_start
-            total_ops = N * step
-            rate = total_ops / t_elapsed
-            print(f"⏱️ Passo {step:,} | Saltos Totais: {total_ops:,} | Velocidade: {rate/1e3:.2f} Kops/s | DPs Capturados: {dp_count:,}")
+        # Print live stats every step (which now represents inner_k unrolled steps)
+        t_elapsed = time.time() - t_start
+        total_ops = N * step * inner_k
+        rate = total_ops / t_elapsed
+        print(f"⏱️ Ciclo {step:,} ({step * inner_k:,} saltos/canguru) | Saltos Totais: {total_ops:,} | Velocidade: {rate/1e6:.4f} Mops/s ({rate/1e3:.2f} Kops/s) | DPs: {dp_count:,}")
 
         # If finite steps requested, exit after reaching limit
         if args.steps > 0 and step >= args.steps:
-
             break
 
 
