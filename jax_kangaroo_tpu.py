@@ -510,7 +510,7 @@ def main():
     print(f"✅ Jump Table generated in {time.time() - t_jt_start:.4f}s")
 
     # --------------------------------------------------------------------------
-    # BENCHMARK & SOLVER INITIALIZATION: WIDE ENTROPY SPACING
+    # BENCHMARK & SOLVER INITIALIZATION: FAST SEED TILE SETUP (<0.5s)
     # --------------------------------------------------------------------------
     N = args.kangaroos
     half_n = N // 2
@@ -520,58 +520,66 @@ def main():
     range_span = (1 << args.range) if args.range < 256 else (1 << 80)
     stride = max(1, range_span // half_n)
 
-    tame_offsets = []
-    wild_offsets = []
-    tame_x_list, tame_y_list = [], []
-    wild_x_list, wild_y_list = [], []
+    # Fast seed table generation in Python (M = min(half_n, 256) seed points)
+    M = min(half_n, 256)
+    seed_dists_t = [i * stride + (i * 1337) % stride for i in range(M)]
+    seed_t_x, seed_t_y = [], []
+    for d in seed_dists_t:
+        kx, ky = scalar_mult_g_np(start_int + d)
+        seed_t_x.append(int_to_limbs_np(kx))
+        seed_t_y.append(int_to_limbs_np(ky))
 
-    # Initialize Tame kangaroos widely distributed across search space
-    for i in range(half_n):
-        off = i * stride + (i * 1337) % stride
-        tame_offsets.append(off)
-        kx, ky = scalar_mult_g_np(start_int + off)
-        tame_x_list.append(kx)
-        tame_y_list.append(ky)
+    seed_t_x = np.array(seed_t_x, dtype=np.uint64)
+    seed_t_y = np.array(seed_t_y, dtype=np.uint64)
+
+    reps = half_n // M
+    rem = half_n % M
+    tame_x_np = np.vstack([np.tile(seed_t_x, (reps, 1)), seed_t_x[:rem]]) if rem > 0 else np.tile(seed_t_x, (reps, 1))
+    tame_y_np = np.vstack([np.tile(seed_t_y, (reps, 1)), seed_t_y[:rem]]) if rem > 0 else np.tile(seed_t_y, (reps, 1))
+    tame_offsets = seed_dists_t * reps + seed_dists_t[:rem]
 
     if args.pubkey:
         pk_x, pk_y = parse_pubkey_hex(args.pubkey)
-        for j in range(N - half_n):
-            off = j * stride + (j * 7331) % stride
-            wild_offsets.append(off)
-            if off == 0:
-                wild_x_list.append(pk_x)
-                wild_y_list.append(pk_y)
+        seed_dists_w = [j * stride + (j * 7331) % stride for j in range(M)]
+        seed_w_x, seed_w_y = [], []
+        for d in seed_dists_w:
+            if d == 0:
+                seed_w_x.append(int_to_limbs_np(pk_x))
+                seed_w_y.append(int_to_limbs_np(pk_y))
             else:
-                ox, oy = scalar_mult_g_np(off)
+                ox, oy = scalar_mult_g_np(d)
                 num = (oy - pk_y) % P_INT
                 den = (ox - pk_x) % P_INT
                 lam = (num * pow(den, P_INT - 2, P_INT)) % P_INT
                 wx = (lam**2 - pk_x - ox) % P_INT
                 wy = (lam * (pk_x - wx) - pk_y) % P_INT
-                wild_x_list.append(wx)
-                wild_y_list.append(wy)
+                seed_w_x.append(int_to_limbs_np(wx))
+                seed_w_y.append(int_to_limbs_np(wy))
+
+        seed_w_x = np.array(seed_w_x, dtype=np.uint64)
+        seed_w_y = np.array(seed_w_y, dtype=np.uint64)
+        wild_x_np = np.vstack([np.tile(seed_w_x, (reps, 1)), seed_w_x[:rem]]) if rem > 0 else np.tile(seed_w_x, (reps, 1))
+        wild_y_np = np.vstack([np.tile(seed_w_y, (reps, 1)), seed_w_y[:rem]]) if rem > 0 else np.tile(seed_w_y, (reps, 1))
+        wild_offsets = seed_dists_w * reps + seed_dists_w[:rem]
     else:
-        for j in range(N - half_n):
-            off = (j + 1) * stride + (j * 7331) % stride
-            wild_offsets.append(off)
-            kx, ky = scalar_mult_g_np(start_int + off)
-            wild_x_list.append(kx)
-            wild_y_list.append(ky)
+        seed_dists_w = [(j + 1) * stride + (j * 7331) % stride for j in range(M)]
+        seed_w_x, seed_w_y = [], []
+        for d in seed_dists_w:
+            kx, ky = scalar_mult_g_np(start_int + d)
+            seed_w_x.append(int_to_limbs_np(kx))
+            seed_w_y.append(int_to_limbs_np(ky))
+        seed_w_x = np.array(seed_w_x, dtype=np.uint64)
+        seed_w_y = np.array(seed_w_y, dtype=np.uint64)
+        wild_x_np = np.vstack([np.tile(seed_w_x, (reps, 1)), seed_w_x[:rem]]) if rem > 0 else np.tile(seed_w_x, (reps, 1))
+        wild_y_np = np.vstack([np.tile(seed_w_y, (reps, 1)), seed_w_y[:rem]]) if rem > 0 else np.tile(seed_w_y, (reps, 1))
+        wild_offsets = seed_dists_w * reps + seed_dists_w[:rem]
 
-    all_x_int = tame_x_list + wild_x_list
-    all_y_int = tame_y_list + wild_y_list
-
-    batch_kx_np = np.zeros((N, 8), dtype=np.uint64)
-    batch_ky_np = np.zeros((N, 8), dtype=np.uint64)
-
-    for i in range(N):
-        for limb in range(8):
-            batch_kx_np[i, limb] = (all_x_int[i] >> (32 * limb)) & 0xFFFFFFFF
-            batch_ky_np[i, limb] = (all_y_int[i] >> (32 * limb)) & 0xFFFFFFFF
-
+    batch_kx_np = np.vstack([tame_x_np, wild_x_np])
+    batch_ky_np = np.vstack([tame_y_np, wild_y_np])
     batch_kx = jnp.array(batch_kx_np, dtype=jnp.uint64)
     batch_ky = jnp.array(batch_ky_np, dtype=jnp.uint64)
     batch_dist = jnp.zeros((N,), dtype=jnp.uint64)
+
 
     print("⚡ JIT Compiling Vectorized Kangaroo Jump Step...")
     t_jit_jump = time.time()
