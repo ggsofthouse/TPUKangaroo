@@ -525,7 +525,7 @@ def main():
     parser.add_argument('--dp-bits', type=int, default=None, help="Distinguished point bits (auto-recommended targeting 500-1000 DPs/step if not specified)")
     parser.add_argument('--steps', type=int, default=0, help="Steps to run (0 for infinite loop)")
     parser.add_argument('--jump-table-size', type=int, default=64, choices=[32, 64, 128], help="Jump table size (32, 64 or 128)")
-    parser.add_argument('--inner-steps', type=int, default=10, help="TPU hardware inner unrolled steps per cycle (default: 10)")
+    parser.add_argument('--inner-steps', type=int, default=500, help="TPU hardware inner unrolled steps per cycle (default: 500)")
     args = parser.parse_args()
 
     print("================================================================================")
@@ -770,7 +770,7 @@ def main():
         print(f"🎯 Distinguished Points (DP) ativado: Lowest {dp_bits} bits masked (0x{(1 << dp_bits) - 1:X}, ~{expected_dps:,} DPs por passo)")
 
     dp_mask = jnp.uint64((1 << dp_bits) - 1)
-    steps_per_block = args.inner_steps if args.inner_steps > 0 else 10
+    steps_per_block = args.inner_steps if args.inner_steps > 0 else 500
     print(f"🔥 MÁXIMA FORÇA ATIVADA: JIT Compilando blocos de {steps_per_block:,} saltos confinados...")
     t_jit_jump = time.time()
     test_fx, test_fy, test_fd, test_dp = engine["tpu_conconfined_loop"](
@@ -806,15 +806,16 @@ def main():
         total_dps += len(indices_dp)
 
         if len(indices_dp) > 0:
-            curr_x_np = np.array(curr_x)
-            curr_dist_np = np.array(curr_dist)
-            for global_idx in indices_dp:
-                x_hex = hex(limbs_to_int_np(curr_x_np[global_idx]))
-                d_val = int(curr_dist_np[global_idx])
+            dp_indices_jax = jnp.array(indices_dp)
+            dp_x_np = np.array(curr_x[dp_indices_jax].block_until_ready())
+            dp_dist_np = np.array(curr_dist[dp_indices_jax].block_until_ready())
+            
+            log_lines = []
+            for i, global_idx in enumerate(indices_dp):
+                x_hex = hex(limbs_to_int_np(dp_x_np[i]))
+                d_val = int(dp_dist_np[i])
                 k_type = types_np[global_idx]
-
-                with open(dp_log_filename, "a") as f:
-                    f.write(f"BLOCK:{bloco} | ID:{global_idx} | TYPE:{k_type} | DIST:{d_val} | X:{x_hex}\n")
+                log_lines.append(f"BLOCK:{bloco} | ID:{global_idx} | TYPE:{k_type} | DIST:{d_val} | X:{x_hex}\n")
 
                 if x_hex in dp_database:
                     prev_type, prev_dist, prev_id = dp_database[x_hex]
@@ -847,6 +848,9 @@ def main():
                         sys.exit(0)
                 else:
                     dp_database[x_hex] = (k_type, d_val, global_idx)
+
+            with open(dp_log_filename, "a") as f:
+                f.writelines(log_lines)
 
         t_elapsed = time.time() - t_start
         total_ops = N * bloco * steps_per_block
