@@ -738,7 +738,7 @@ def main():
     parser.add_argument('--backend',        type=str,   default='cpu', choices=['cpu', 'gpu', 'tpu'])
     parser.add_argument('--pubkey',         type=str,   default=None,  help="Target public key hex (02/03/04...)")
     parser.add_argument('--start',          type=str,   default=None,  help="Start offset hex")
-    parser.add_argument('--kangaroos',      type=int,   default=65536, help="Total kangaroos (tame+wild)")
+    parser.add_argument('--kangaroos',      type=int,   default=131072,help="Total kangaroos (tame+wild)")
     parser.add_argument('--dp-bits',        type=int,   default=None,  help="DP mask bits (auto if not set)")
     parser.add_argument('--steps',          type=int,   default=0,     help="Max total steps (0=infinite)")
     parser.add_argument('--jump-table-size',type=int,   default=64,    choices=[32, 64, 128])
