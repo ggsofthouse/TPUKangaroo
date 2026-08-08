@@ -522,7 +522,8 @@ def build_jax_math_engine(jax):
                 return next_inv, inv_col
 
             _, inv_2d_t = jax.lax.scan(bwd, total_inv, jnp.arange(C - 1, -1, -1))
-            inv_2d = jnp.transpose(inv_2d_t, (1, 0, 2))
+            inv_2d_rev = jnp.flip(inv_2d_t, axis=0)    # Un-reverse the scanned column outputs!
+            inv_2d = jnp.transpose(inv_2d_rev, (1, 0, 2))
             inv_2d = jnp.where(is_zero[..., None], jnp.zeros_like(a_2d), inv_2d)
             return jnp.reshape(inv_2d, (N_tot, 8))
 
