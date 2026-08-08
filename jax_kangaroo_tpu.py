@@ -547,6 +547,13 @@ def build_jax_math_engine(jax):
         "mega_loop":           jacobian_mega_loop,
     }
 
+# ─── Affine reset helper (called on host, outside engine) ─────────────────────
+# After each mega-loop call we normalise ALL kangaroos back to affine (Z=1) so
+# that DP detection is performed on the TRUE affine x coordinate, not the
+# Jacobian X proxy (which is affine_x × Z² and is decorrelated from affine_x
+# after even a handful of Jacobian steps).
+_ONE_LIMBS_GLOBAL = np.array([1,0,0,0,0,0,0,0], dtype=np.uint64)
+
 
 # ─── Async DP Writer ──────────────────────────────────────────────────────────
 class AsyncDPWriter:
@@ -711,8 +718,8 @@ def main():
     parser.add_argument('--dp-bits',        type=int,   default=None,  help="DP mask bits (auto if not set)")
     parser.add_argument('--steps',          type=int,   default=0,     help="Max total steps (0=infinite)")
     parser.add_argument('--jump-table-size',type=int,   default=64,    choices=[32, 64, 128])
-    parser.add_argument('--steps-per-block',type=int,   default=50,    help="Inner fori_loop steps per block")
-    parser.add_argument('--n-blocks',       type=int,   default=20,    help="Outer blocks per mega-loop call")
+    parser.add_argument('--steps-per-block',type=int,   default=8,     help="Inner fori_loop steps per block (keep small for correct DP detection)")
+    parser.add_argument('--n-blocks',       type=int,   default=1,     help="Outer blocks per mega-loop call")
     args = parser.parse_args()
 
     print("=" * 80)
@@ -850,7 +857,8 @@ def main():
         while True:
             call_idx += 1
 
-            curr_X, curr_Y, curr_Z, curr_dist, dp_flags = engine["mega_loop"](
+            # ── Run Jacobian steps on TPU ─────────────────────────────────
+            curr_X, curr_Y, curr_Z, curr_dist, _dp_flags_unused = engine["mega_loop"](
                 curr_X, curr_Y, curr_Z, curr_dist,
                 tx_jax, ty_jax, td_jax,
                 dp_mask,
@@ -858,34 +866,36 @@ def main():
                 n_blocks=n_blocks,
             )
 
-            # ── DP Processing (host side) ─────────────────────────────────
-            dp_flags_cpu = np.array(dp_flags.block_until_ready())
-            indices_dp   = np.where(dp_flags_cpu)[0]
-            total_dps   += len(indices_dp)
+            # ── Convert ALL kangaroos Jacobian → Affine (batch Montgomery) ─
+            # This is the ONLY correct way to detect genuine DPs: after Jacobian
+            # steps Z >> 1, so Jacobian X = affine_x × Z² is NOT affine_x.
+            # Cost: one batch inversion for all N kangaroos — negligible overhead.
+            curr_X_aff, curr_Y_aff = engine["jac_to_affine"](curr_X, curr_Y, curr_Z)
+            curr_X_aff.block_until_ready()
+
+            # ── Reset Z=1 so next call starts from affine positions ───────
+            ones = jnp.broadcast_to(
+                jnp.array([1,0,0,0,0,0,0,0], dtype=jnp.uint64), curr_X.shape
+            )
+            curr_X = curr_X_aff
+            curr_Y = curr_Y_aff
+            curr_Z = ones
+
+            # ── Genuine DP check on TRUE affine X (vectorised) ────────────
+            x_np = np.array(curr_X_aff)          # (N, 8)
+            d_np = np.array(curr_dist)            # (N,)
+
+            low_bits   = x_np[:, 0].astype(np.uint64) & np.uint64(int(dp_mask))
+            indices_dp = np.where(low_bits == 0)[0]
+            total_dps += len(indices_dp)
 
             if len(indices_dp) > 0:
-                # Fetch Jacobian coords of DP candidates
-                dp_idx_jax = jnp.array(indices_dp)
-                dpX = jnp.take(curr_X,    dp_idx_jax, axis=0)
-                dpY = jnp.take(curr_Y,    dp_idx_jax, axis=0)
-                dpZ = jnp.take(curr_Z,    dp_idx_jax, axis=0)
-                dpD = jnp.take(curr_dist, dp_idx_jax, axis=0)
-
-                # Convert Jacobian → Affine using batch Montgomery inversion
-                dp_x_aff, _ = engine["jac_to_affine"](dpX, dpY, dpZ)
-                dp_x_np   = np.array(dp_x_aff.block_until_ready())
-                dp_dist_np = np.array(dpD.block_until_ready())
-
                 log_lines = []
-                for i, global_idx in enumerate(indices_dp):
-                    x_hex = hex(limbs_to_int_np(dp_x_np[i]))
-                    d_val = int(dp_dist_np[i])
+                for global_idx in indices_dp:
+                    x_int  = limbs_to_int_np(x_np[global_idx])
+                    x_hex  = hex(x_int)
+                    d_val  = int(d_np[global_idx])
                     k_type = types_np[global_idx]
-
-                    # Verify it's a genuine DP (affine x has correct low bits)
-                    x_int = limbs_to_int_np(dp_x_np[i])
-                    if (x_int & int(dp_mask)) != 0:
-                        continue  # Jacobian X proxy was a false positive — skip
 
                     log_lines.append(
                         f"CALL:{call_idx} | ID:{global_idx} | TYPE:{k_type} | "
@@ -896,11 +906,11 @@ def main():
                         prev_type, prev_dist, prev_id = dp_database[x_hex]
                         if prev_type != k_type:
                             print("\n" + "=" * 80)
-                            print("🎉 BINGO! DISTINGUISHED POINT COLLISION DETECTED!")
+                            print("BINGO! DISTINGUISHED POINT COLLISION DETECTED!")
                             print("=" * 80)
-                            print(f"📍 X: {x_hex}")
-                            print(f"🦘 Point 1: [{prev_type}] ID {prev_id} | dist={prev_dist}")
-                            print(f"🦘 Point 2: [{k_type}] ID {global_idx} | dist={d_val}")
+                            print(f"X: {x_hex}")
+                            print(f"Point 1: [{prev_type}] ID {prev_id} | dist={prev_dist}")
+                            print(f"Point 2: [{k_type}] ID {global_idx} | dist={d_val}")
 
                             if prev_type == 'TAME':
                                 t_idx, t_d = prev_id, prev_dist
@@ -909,7 +919,6 @@ def main():
                                 t_idx, t_d = global_idx, d_val
                                 w_idx, w_d = prev_id - half_n, prev_dist
 
-                            # Guard against out-of-range wild index
                             w_idx = max(0, min(w_idx, len(wild_offsets) - 1))
                             t_off = tame_offsets[t_idx] if t_idx < len(tame_offsets) else 0
                             w_off = wild_offsets[w_idx]  if w_idx < len(wild_offsets) else 0
@@ -917,13 +926,13 @@ def main():
                             priv_key_int = (start_int + t_off + t_d - (w_off + w_d)) % N_ORDER
                             priv_key_hex = f"{priv_key_int:064x}"
 
-                            print(f"🔑 PRIVATE KEY: 0x{priv_key_hex}")
+                            print(f"PRIVATE KEY: 0x{priv_key_hex}")
                             with open("RESULTS.TXT", "a") as rf:
                                 rf.write(
                                     f"Puzzle #{args.range} Solved! "
                                     f"Private Key: {priv_key_hex} | X: {x_hex}\n"
                                 )
-                            print(f"💾 Saved to RESULTS.TXT")
+                            print("Saved to RESULTS.TXT")
                             print("=" * 80)
                             dp_log_writer.close()
                             sys.exit(0)
