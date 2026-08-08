@@ -449,19 +449,24 @@ def build_jax_math_engine(jax):
     # ─── Validation helper (affine, used only in self-test) ──────────────────
     @jax.jit
     def ecc_double_affine(x1: jnp.ndarray, y1: jnp.ndarray):
-        """Affine point doubling — used only in the math self-test, not in the solver."""
+        """
+        Affine point doubling for secp256k1 (a=0) — used ONLY in the math self-test.
+        λ = 3x₁² / (2y₁)
+        x₃ = λ² − 2x₁
+        y₃ = λ(x₁ − x₃) − y₁
+        """
         x1_sq = mul_256_mod_p(x1, x1)
         three = jnp.array([3, 0, 0, 0, 0, 0, 0, 0], dtype=jnp.uint64)
         num = mul_256_mod_p(x1_sq, jnp.broadcast_to(three, x1.shape))
         two = jnp.array([2, 0, 0, 0, 0, 0, 0, 0], dtype=jnp.uint64)
-        den = mul_256_mod_p(x1, jnp.broadcast_to(two, x1.shape))
+        den = mul_256_mod_p(y1, jnp.broadcast_to(two, y1.shape))  # 2·y₁ (not x1!)
         den_inv = inv_mod_p(den)
         lam = mul_256_mod_p(num, den_inv)
         lam2 = mul_256_mod_p(lam, lam)
         two_x1 = add_256_raw(x1, x1)
         x3 = sub_256_raw(lam2, two_x1)
         x1_minus_x3 = sub_256_raw(x1, x3)
-        y3 = sub_256_raw(mul_256_mod_p(lam, x1_minus_x3), x1)
+        y3 = sub_256_raw(mul_256_mod_p(lam, x1_minus_x3), y1)  # subtract y₁ (not x1!)
         return x3, y3
 
     # ─── Jacobian Kangaroo Jump Engine ────────────────────────────────────────
