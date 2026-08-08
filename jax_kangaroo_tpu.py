@@ -472,63 +472,56 @@ def build_jax_math_engine(jax):
     # ─── Jacobian Kangaroo Jump Engine ────────────────────────────────────────
 
     @functools.partial(jax.jit, static_argnames=('steps_per_block', 'n_blocks'))
-    def jacobian_mega_loop(
-        init_X: jnp.ndarray, init_Y: jnp.ndarray, init_Z: jnp.ndarray,
+    def affine_mega_loop(
+        init_x: jnp.ndarray, init_y: jnp.ndarray,
         init_dist: jnp.ndarray,
         table_x: jnp.ndarray, table_y: jnp.ndarray, table_dists: jnp.ndarray,
         dp_mask: jnp.uint64,
-        steps_per_block: int = 50,
-        n_blocks: int = 20,
+        steps_per_block: int = 20,
+        n_blocks: int = 5,
     ):
         """
         ╔══════════════════════════════════════════════════════════════════════╗
-        ║  JACOBIAN MEGA-LOOP — Core TPU Kernel                               ║
+        ║  AFFINE MEGA-LOOP — 100% Deterministic Trajectories                  ║
         ║                                                                      ║
-        ║  Executes n_blocks × steps_per_block sequential ECC jumps on-device ║
-        ║  using Jacobian-Affine mixed addition (ZERO inversions in the loop). ║
-        ║                                                                      ║
-        ║  A single DP snapshot (last position of each kangaroo) is returned  ║
-        ║  to the host every n_blocks × steps_per_block steps, minimizing     ║
-        ║  host↔TPU synchronization overhead.                                 ║
+        ║  Executes jumps in pure Affine (x,y) coordinates.                    ║
+        ║  guarantees jump_idx = x_affine mod table_size is 100% deterministic ║
+        ║  so TAME and WILD kangaroos ALWAYS merge onto the exact same path   ║
+        ║  when they land on the same point!                                   ║
         ╚══════════════════════════════════════════════════════════════════════╝
-
-        Args:
-            init_X, init_Y, init_Z: Jacobian coords, shape (N, 8)
-            init_dist:               accumulated distance,  shape (N,)
-            table_x, table_y:        affine jump table,     shape (T, 8)
-            table_dists:             jump scalar distances,  shape (T,)
-            dp_mask:                 DP detection mask (low dp_bits must be 0)
-            steps_per_block:         inner fori_loop iterations (static)
-            n_blocks:                outer loop iterations (static)
-
-        Returns:
-            final_X, final_Y, final_Z, final_dist, dp_flags (all shape (N, 8) or (N,))
         """
         table_size = table_x.shape[0]
-        ones = jnp.broadcast_to(jnp.array([1, 0, 0, 0, 0, 0, 0, 0], dtype=jnp.uint64), init_X.shape)
 
         def inner_body(i, state):
-            cX, cY, cZ, cd = state
-            jump_idx = (cX[..., 0] & jnp.uint64(table_size - 1)).astype(jnp.int32)
+            cx, cy, cd = state
+            # jump_idx MUST be derived from true Affine X coordinate for deterministic convergence!
+            jump_idx = (cx[..., 0] & jnp.uint64(table_size - 1)).astype(jnp.int32)
             j_x = jnp.take(table_x, jump_idx, axis=0)   # affine jump point
             j_y = jnp.take(table_y, jump_idx, axis=0)
             j_d = jnp.take(table_dists, jump_idx, axis=0)
-            # Mixed Jacobian-Affine addition: ZERO inversions
-            nX, nY, nZ = jac_add_affine_rhs(cX, cY, cZ, j_x, j_y)
+
+            # Affine Addition: (cx, cy) + (j_x, j_y)
+            dx = sub_256_raw(j_x, cx)
+            dy = sub_256_raw(j_y, cy)
+            inv_dx = inv_mod_p(dx)                     # Parallel Fermat inversion across N
+            lam = mul_256_mod_p(dy, inv_dx)
+            lam2 = mul_256_mod_p(lam, lam)
+
+            nx = sub_256_raw(sub_256_raw(lam2, cx), j_x)
+            cx_m_nx = sub_256_raw(cx, nx)
+            ny = sub_256_raw(mul_256_mod_p(lam, cx_m_nx), cy)
             nd = cd + j_d
-            return nX, nY, nZ, nd
+            return nx, ny, nd
 
         def outer_body(b, state):
-            cX, cY, cZ, cd = state
-            cX, cY, cZ, cd = jax.lax.fori_loop(0, steps_per_block, inner_body, (cX, cY, cZ, cd))
-            # Normalize to affine on TPU at end of block & reset Z=1
-            cX_aff, cY_aff = jac_to_affine_batch(cX, cY, cZ)
-            return cX_aff, cY_aff, ones, cd
+            cx, cy, cd = state
+            cx, cy, cd = jax.lax.fori_loop(0, steps_per_block, inner_body, (cx, cy, cd))
+            return cx, cy, cd
 
-        fX, fY, fZ, fd = jax.lax.fori_loop(0, n_blocks, outer_body, (init_X, init_Y, init_Z, init_dist))
+        fx, fy, fd = jax.lax.fori_loop(0, n_blocks, outer_body, (init_x, init_y, init_dist))
 
-        dp_flags = (fX[..., 0] & dp_mask) == jnp.uint64(0)
-        return fX, fY, fZ, fd, dp_flags
+        dp_flags = (fx[..., 0] & dp_mask) == jnp.uint64(0)
+        return fx, fy, fd, dp_flags
 
     return {
         "add_256":             add_256_raw,
@@ -541,7 +534,7 @@ def build_jax_math_engine(jax):
         "jac_double":          jac_double,
         "jac_to_affine":       jac_to_affine_batch,
         "ecc_double_affine":   ecc_double_affine,
-        "mega_loop":           jacobian_mega_loop,
+        "mega_loop":           affine_mega_loop,
     }
 
 # ─── Affine reset helper (called on host, outside engine) ─────────────────────
@@ -715,8 +708,8 @@ def main():
     parser.add_argument('--dp-bits',        type=int,   default=None,  help="DP mask bits (auto if not set)")
     parser.add_argument('--steps',          type=int,   default=0,     help="Max total steps (0=infinite)")
     parser.add_argument('--jump-table-size',type=int,   default=64,    choices=[32, 64, 128])
-    parser.add_argument('--steps-per-block',type=int,   default=200,   help="Inner fori_loop steps per block")
-    parser.add_argument('--n-blocks',       type=int,   default=10,    help="Outer blocks per mega-loop call")
+    parser.add_argument('--steps-per-block',type=int,   default=20,    help="Inner fori_loop steps per block (Affine mode)")
+    parser.add_argument('--n-blocks',       type=int,   default=5,     help="Outer blocks per mega-loop call")
     args = parser.parse_args()
 
     print("=" * 80)
@@ -821,17 +814,17 @@ def main():
     n_blocks        = args.n_blocks
     total_per_call  = steps_per_block * n_blocks
 
-    print(f"\n🔥 JIT compiling Jacobian Mega-Loop "
+    print(f"\n🔥 JIT compiling Deterministic Affine Mega-Loop "
           f"({n_blocks}×{steps_per_block}={total_per_call} steps/call)...")
     t0 = time.time()
-    _fX, _fY, _fZ, _fd, _dp = engine["mega_loop"](
-        batch_X, batch_Y, batch_Z, batch_dist,
+    _fx, _fy, _fd, _dp = engine["mega_loop"](
+        batch_X, batch_Y, batch_dist,
         tx_jax, ty_jax, td_jax,
         dp_mask,
         steps_per_block=steps_per_block,
         n_blocks=n_blocks,
     )
-    _fX.block_until_ready()
+    _fx.block_until_ready()
     jit_time = time.time() - t0
     print(f"✅ JIT compilation done in {jit_time:.2f}s")
 
@@ -844,9 +837,8 @@ def main():
     print("=" * 80)
 
     t_start  = time.time()
-    curr_X   = batch_X
-    curr_Y   = batch_Y
-    curr_Z   = batch_Z
+    curr_x   = batch_X
+    curr_y   = batch_Y
     curr_dist = batch_dist
     call_idx  = 0
 
@@ -854,33 +846,18 @@ def main():
         while True:
             call_idx += 1
 
-            # ── Run Jacobian steps on TPU ─────────────────────────────────
-            curr_X, curr_Y, curr_Z, curr_dist, _dp_flags_unused = engine["mega_loop"](
-                curr_X, curr_Y, curr_Z, curr_dist,
+            # ── Run Deterministic Affine steps on TPU ─────────────────────
+            curr_x, curr_y, curr_dist, _dp_flags_unused = engine["mega_loop"](
+                curr_x, curr_y, curr_dist,
                 tx_jax, ty_jax, td_jax,
                 dp_mask,
                 steps_per_block=steps_per_block,
                 n_blocks=n_blocks,
             )
 
-            # ── Convert ALL kangaroos Jacobian → Affine (batch Montgomery) ─
-            # This is the ONLY correct way to detect genuine DPs: after Jacobian
-            # steps Z >> 1, so Jacobian X = affine_x × Z² is NOT affine_x.
-            # Cost: one batch inversion for all N kangaroos — negligible overhead.
-            curr_X_aff, curr_Y_aff = engine["jac_to_affine"](curr_X, curr_Y, curr_Z)
-            curr_X_aff.block_until_ready()
-
-            # ── Reset Z=1 so next call starts from affine positions ───────
-            ones = jnp.broadcast_to(
-                jnp.array([1,0,0,0,0,0,0,0], dtype=jnp.uint64), curr_X.shape
-            )
-            curr_X = curr_X_aff
-            curr_Y = curr_Y_aff
-            curr_Z = ones
-
             # ── Genuine DP check on TRUE affine X (vectorised) ────────────
-            x_np = np.array(curr_X_aff)          # (N, 8)
-            d_np = np.array(curr_dist)            # (N,)
+            x_np = np.array(curr_x.block_until_ready())    # (N, 8)
+            d_np = np.array(curr_dist)                     # (N,)
 
             low_bits   = x_np[:, 0].astype(np.uint64) & np.uint64(int(dp_mask))
             indices_dp = np.where(low_bits == 0)[0]
