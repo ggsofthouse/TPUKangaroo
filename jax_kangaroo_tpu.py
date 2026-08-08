@@ -436,10 +436,10 @@ def build_jax_math_engine(jax):
     @jax.jit
     def jac_to_affine_batch(X_batch, Y_batch, Z_batch):
         """
-        Converts N Jacobian points to affine using Montgomery batch inversion.
-        Called ONLY at DP extraction — not in the hot loop.
+        Converts N Jacobian points to affine using parallel Fermat inversion across N elements.
+        Parallelised on TPU: 256 vectorised steps instead of 65536 scan steps.
         """
-        Z_inv = batch_inverse_mod_p(Z_batch)          # 1/Z  — batch Montgomery
+        Z_inv = inv_mod_p(Z_batch)                     # 1/Z  — 256 parallel steps on TPU
         Z_inv2 = mul_256_mod_p(Z_inv, Z_inv)          # 1/Z²
         Z_inv3 = mul_256_mod_p(Z_inv2, Z_inv)         # 1/Z³
         x_aff = mul_256_mod_p(X_batch, Z_inv2)
@@ -718,8 +718,8 @@ def main():
     parser.add_argument('--dp-bits',        type=int,   default=None,  help="DP mask bits (auto if not set)")
     parser.add_argument('--steps',          type=int,   default=0,     help="Max total steps (0=infinite)")
     parser.add_argument('--jump-table-size',type=int,   default=64,    choices=[32, 64, 128])
-    parser.add_argument('--steps-per-block',type=int,   default=8,     help="Inner fori_loop steps per block (keep small for correct DP detection)")
-    parser.add_argument('--n-blocks',       type=int,   default=1,     help="Outer blocks per mega-loop call")
+    parser.add_argument('--steps-per-block',type=int,   default=16,    help="Inner fori_loop steps per block")
+    parser.add_argument('--n-blocks',       type=int,   default=4,     help="Outer blocks per mega-loop call")
     args = parser.parse_args()
 
     print("=" * 80)
