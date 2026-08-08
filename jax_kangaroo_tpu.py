@@ -505,11 +505,10 @@ def build_jax_math_engine(jax):
             final_X, final_Y, final_Z, final_dist, dp_flags (all shape (N, 8) or (N,))
         """
         table_size = table_x.shape[0]
+        ones = jnp.broadcast_to(jnp.array([1, 0, 0, 0, 0, 0, 0, 0], dtype=jnp.uint64), init_X.shape)
 
         def inner_body(i, state):
             cX, cY, cZ, cd = state
-            # Jump index from lowest bits of current X (which is X/Z²; we use
-            # the low limb of the Jacobian X as a fast, low-correlation proxy)
             jump_idx = (cX[..., 0] & jnp.uint64(table_size - 1)).astype(jnp.int32)
             j_x = jnp.take(table_x, jump_idx, axis=0)   # affine jump point
             j_y = jnp.take(table_y, jump_idx, axis=0)
@@ -522,14 +521,12 @@ def build_jax_math_engine(jax):
         def outer_body(b, state):
             cX, cY, cZ, cd = state
             cX, cY, cZ, cd = jax.lax.fori_loop(0, steps_per_block, inner_body, (cX, cY, cZ, cd))
-            return cX, cY, cZ, cd
+            # Normalize to affine on TPU at end of block & reset Z=1
+            cX_aff, cY_aff = jac_to_affine_batch(cX, cY, cZ)
+            return cX_aff, cY_aff, ones, cd
 
         fX, fY, fZ, fd = jax.lax.fori_loop(0, n_blocks, outer_body, (init_X, init_Y, init_Z, init_dist))
 
-        # DP flag check: we check low bits of fX (Jacobian X coord).
-        # NOTE: This is a HEURISTIC check — the actual affine x = X/Z².
-        # After mega-loop, we do a full Jacobian→Affine conversion on flagged
-        # kangaroos in the host to confirm true DPs.
         dp_flags = (fX[..., 0] & dp_mask) == jnp.uint64(0)
         return fX, fY, fZ, fd, dp_flags
 
@@ -718,8 +715,8 @@ def main():
     parser.add_argument('--dp-bits',        type=int,   default=None,  help="DP mask bits (auto if not set)")
     parser.add_argument('--steps',          type=int,   default=0,     help="Max total steps (0=infinite)")
     parser.add_argument('--jump-table-size',type=int,   default=64,    choices=[32, 64, 128])
-    parser.add_argument('--steps-per-block',type=int,   default=16,    help="Inner fori_loop steps per block")
-    parser.add_argument('--n-blocks',       type=int,   default=4,     help="Outer blocks per mega-loop call")
+    parser.add_argument('--steps-per-block',type=int,   default=200,   help="Inner fori_loop steps per block")
+    parser.add_argument('--n-blocks',       type=int,   default=10,    help="Outer blocks per mega-loop call")
     args = parser.parse_args()
 
     print("=" * 80)
