@@ -806,10 +806,8 @@ def main():
     # ── DP Bits ───────────────────────────────────────────────────────────────
     N = args.kangaroos
     if args.dp_bits is None or args.dp_bits <= 0:
-        # Target ~16 DPs per mega-loop call
-        steps_per_call = args.n_blocks * args.steps_per_block
-        rec_bits = max(4, min(32, int(math.log2(N)) - 2))
-        dp_bits  = rec_bits
+        # Scale dp_bits relative to puzzle range so kangaroos stay within the search space!
+        dp_bits = max(2, min(28, args.range // 4))
     else:
         dp_bits = args.dp_bits
     dp_mask = jnp.uint64((1 << dp_bits) - 1)
